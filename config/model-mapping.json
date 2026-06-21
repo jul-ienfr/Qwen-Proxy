@@ -1,0 +1,81 @@
+{
+  "modelMappings": [
+    {
+      "source": "gpt-4",
+      "target": "qwen-plus",
+      "enabled": true
+    },
+    {
+      "source": "gpt-4-turbo",
+      "target": "qwen-plus",
+      "enabled": true
+    },
+    {
+      "source": "gpt-4o",
+      "target": "qwen-plus",
+      "enabled": true
+    },
+    {
+      "source": "gpt-3.5-turbo",
+      "target": "qwen-turbo",
+      "enabled": true
+    },
+    {
+      "source": "claude-3-opus",
+      "target": "qwen-max",
+      "enabled": true
+    },
+    {
+      "source": "claude-3-sonnet",
+      "target": "qwen-plus",
+      "enabled": true
+    },
+    {
+      "source": "claude-3-haiku",
+      "target": "qwen-turbo",
+      "enabled": true
+    },
+    {
+      "source": "claude-opus-4-8",
+      "target": "qwen3.7-max",
+      "enabled": true
+    },
+    {
+      "source": "claude-sonnet-4-6",
+      "target": "qwen3.7-plus",
+      "enabled": true
+    },
+    {
+      "source": "claude-haiku-4-5",
+      "target": "qwen-turbo",
+      "enabled": true
+    },
+    {
+      "source": "claude-fable-5",
+      "target": "qwen3.7-max",
+      "enabled": true
+    },
+    {
+      "source": "mimo-v2.5-pro",
+      "target": "qwen3.7-plus",
+      "enabled": true
+    },
+    {
+      "source": "mimo-v2.5",
+      "target": "qwen3.7-max",
+      "enabled": true
+    }
+  ],
+  "customRoutes": [],
+  "disableAutoMapping": false,
+  "aliases": {
+    "opus": "qwen-max",
+    "opus-4-8": "qwen3.7-max",
+    "sonnet": "qwen-plus",
+    "sonnet-4-6": "qwen3.7-plus",
+    "haiku": "qwen-turbo",
+    "haiku-4-5": "qwen-turbo",
+    "flash": "qwen-turbo",
+    "fable-5": "qwen3.7-max"
+  }
+}

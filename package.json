@@ -1,0 +1,78 @@
+{
+  "name": "@pedrofariasx/qwenproxy",
+  "version": "1.8.0",
+  "description": "Local OpenAI-compatible proxy API that routes requests to Qwen (chat.qwen.ai) via Playwright browser automation.",
+  "scripts": {
+    "start": "npx tsx src/index.ts",
+    "start:firefox": "npx tsx src/index.ts --browser=firefox",
+    "start:chrome": "npx tsx src/index.ts --browser=chrome",
+    "start:edge": "npx tsx src/index.ts --browser=edge",
+    "login": "npx tsx src/login.ts",
+    "login:firefox": "npx tsx src/login.ts --browser=firefox",
+    "login:chrome": "npx tsx src/login.ts --browser=chrome",
+    "login:edge": "npx tsx src/login.ts --browser=edge",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsx --test src/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "bench": "node bench/speed-test.cjs",
+    "bench:fast": "node bench/speed-test.cjs --iterations 3 --warmup 1",
+    "test:e2e": "node bench/e2e-test.cjs"
+  },
+  "keywords": [
+    "openai",
+    "proxy",
+    "qwen",
+    "playwright",
+    "llm",
+    "api",
+    "chat-completions"
+  ],
+  "author": "Pedro Farias",
+  "license": "ISC",
+  "dependencies": {
+    "@hono/node-server": "^2.0.3",
+    "@types/ws": "^8.18.1",
+    "ajv": "^8.20.0",
+    "ali-oss": "^6.23.0",
+    "better-sqlite3": "^12.10.1",
+    "cloakbrowser": "^0.3.32",
+    "dotenv": "^17.4.2",
+    "hono": "^4.12.21",
+    "playwright-core": "^1.61.0",
+    "serverless-http": "^3.2.0",
+    "tsx": "^4.22.3",
+    "uuid": "^14.0.0",
+    "ws": "^8.21.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/exec": "^7.1.0",
+    "@semantic-release/git": "^10.0.1",
+    "@types/ajv": "^0.0.5",
+    "@types/ali-oss": "^6.23.3",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.9.1",
+    "eslint": "^10.5.0",
+    "semantic-release": "^25.0.3",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1"
+  },
+  "bin": {
+    "qwenproxy": "./bin/qwenproxy.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src/**/*",
+    "bin/**/*"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "timeouts.http": 45000,
+  "cache.defaultTTL": 7200,
+  "fastStreamProxy": true
+}

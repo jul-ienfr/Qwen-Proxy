@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="fr" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QwenProxy Dashboard</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="js/cache-manager.js"></script>
+  <script src="js/qwen-transformer.js"></script>
+  <script src="js/direct-client.js"></script>
+  <script>
+    // Register Service Worker for multi-level caching
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js')
+          .then(reg => console.log('[SW] Registered:', reg.scope))
+          .catch(err => console.warn('[SW] Registration failed:', err.message));
+      });
+    }
+  </script>
+</head>
+<body>
+  <div class="app">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-header">
+        <h1>🔮 QwenProxy</h1>
+        <span class="version" id="version">v1.8.0</span>
+      </div>
+      <ul class="nav-tabs">
+        <li class="nav-tab active" data-tab="dashboard">📊 Dashboard</li>
+        <li class="nav-tab" data-tab="history">📋 Historique</li>
+        <li class="nav-tab" data-tab="mapping">🗺️ Mapping</li>
+        <li class="nav-tab" data-tab="models">🤖 Modèles</li>
+        <li class="nav-tab" data-tab="settings">⚙️ Paramètres</li>
+        <li class="nav-tab" data-tab="performance">⚡ Performance</li>
+        <li class="nav-tab" data-tab="debug">🐛 Debug</li>
+      </ul>
+      <div class="sidebar-footer">
+        <button class="theme-toggle" id="themeToggle">🌙</button>
+        <div class="footer-badges">
+          <span class="debug-badge" id="debugBadge" style="display:none">🐛</span>
+          <a href="/health" target="_blank" class="health-badge" id="healthBadge">● healthy</a>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="content">
+      <!-- Dashboard Tab -->
+      <div class="tab-content active" id="tab-dashboard">
+        <h2>📊 Statistiques</h2>
+
+        <!-- Stats Cards -->
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="stat-total">0</div>
+            <div class="stat-label">Requêtes totales</div>
+          </div>
+          <div class="stat-card success">
+            <div class="stat-value" id="stat-success">0</div>
+            <div class="stat-label">Succès</div>
+          </div>
+          <div class="stat-card error">
+            <div class="stat-value" id="stat-failed">0</div>
+            <div class="stat-label">Échecs</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-tokens">0</div>
+            <div class="stat-label">Tokens totaux</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-duration">0ms</div>
+            <div class="stat-label">Durée moyenne</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="stat-cache">0%</div>
+            <div class="stat-label">Cache hit rate</div>
+          </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-grid">
+          <div class="chart-card">
+            <h3>Distribution des tokens</h3>
+            <canvas id="chart-tokens"></canvas>
+          </div>
+          <div class="chart-card">
+            <h3>Requêtes par modèle</h3>
+            <canvas id="chart-models"></canvas>
+          </div>
+          <div class="chart-card wide">
+            <h3>Requêtes par heure</h3>
+            <canvas id="chart-hourly"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- History Tab -->
+      <div class="tab-content" id="tab-history">
+        <div class="tab-header">
+          <h2>📋 Historique des requêtes</h2>
+          <div class="filters">
+            <select id="filter-status">
+              <option value="">Tous les statuts</option>
+              <option value="success">Succès</option>
+              <option value="error">Échecs</option>
+            </select>
+            <select id="filter-model">
+              <option value="">Tous les modèles</option>
+            </select>
+            <select id="filter-protocol">
+              <option value="">Tous les protocoles</option>
+              <option value="openai">OpenAI</option>
+              <option value="anthropic">Anthropic</option>
+              <option value="gemini">Gemini</option>
+            </select>
+            <input type="text" id="filter-search" placeholder="Rechercher...">
+            <button class="btn" id="btn-refresh-history">🔄 Actualiser</button>
+          </div>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Timestamp</th>
+                <th>Modèle original</th>
+                <th>Modèle mappé</th>
+                <th>Protocole</th>
+                <th>Tokens</th>
+                <th>Durée</th>
+                <th>Statut</th>
+              </tr>
+            </thead>
+            <tbody id="history-table-body">
+              <tr><td colspan="7" class="empty">Chargement...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="pagination" id="history-pagination"></div>
+      </div>
+
+      <!-- Mapping Tab -->
+      <div class="tab-content" id="tab-mapping">
+        <div class="tab-header">
+          <h2>🗺️ Model Mapping</h2>
+          <button class="btn" id="btn-add-mapping">➕ Ajouter un mapping</button>
+        </div>
+
+        <div class="mapping-grid">
+          <!-- Standard Mappings -->
+          <div class="mapping-section">
+            <h3>Mappings standards</h3>
+            <div id="mappings-list"></div>
+          </div>
+
+          <!-- Custom Routes -->
+          <div class="mapping-section">
+            <h3>Routes personnalisées</h3>
+            <button class="btn" id="btn-add-route">➕ Ajouter une route</button>
+            <div id="routes-list"></div>
+          </div>
+
+          <!-- Aliases -->
+          <div class="mapping-section">
+            <h3>Alias</h3>
+            <div id="aliases-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Models Tab -->
+      <div class="tab-content" id="tab-models">
+        <div class="tab-header">
+          <h2>🤖 Modèles disponibles</h2>
+          <button class="btn" id="btn-refresh-models">🔄 Actualiser</button>
+        </div>
+
+        <div class="table-container">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Nom</th>
+                <th>Context Window</th>
+                <th>Propriétaire</th>
+              </tr>
+            </thead>
+            <tbody id="models-table-body">
+              <tr><td colspan="4" class="empty">Chargement...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Settings Tab -->
+      <div class="tab-content" id="tab-settings">
+        <div class="tab-header">
+          <h2>⚙️ Paramètres</h2>
+          <div class="settings-actions">
+            <button class="btn btn-secondary" id="btn-reset-all">🔄 Tout réinitialiser</button>
+            <button class="btn btn-primary" id="btn-save-settings" disabled>💾 Sauvegarder</button>
+          </div>
+        </div>
+
+        <div id="settings-form-container">
+          <div class="settings-loading">Chargement...</div>
+        </div>
+      </div>
+
+      <!-- Performance Tab -->
+      <div class="tab-content" id="tab-performance">
+        <div class="tab-header">
+          <h2>⚡ Performance — Vitesse Éclair</h2>
+          <div class="perf-controls">
+            <button class="btn btn-secondary" id="btn-refresh-perf">🔄 Actualiser</button>
+            <button class="btn btn-primary" id="btn-run-bench">🚀 Lancer Benchmark</button>
+          </div>
+        </div>
+
+        <div class="perf-grid">
+          <!-- Config Panel -->
+          <div class="perf-card">
+            <h3>⚙️ Configuration</h3>
+            <div id="perf-config">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+
+          <!-- Path Selection -->
+          <div class="perf-card">
+            <h3>🛤️ Path Selection</h3>
+            <div id="perf-path">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+
+          <!-- TLS Pool -->
+          <div class="perf-card">
+            <h3>🔐 TLS Pool</h3>
+            <div id="perf-tls">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+
+          <!-- WebSocket Bridge -->
+          <div class="perf-card">
+            <h3>🔌 WebSocket Bridge</h3>
+            <div id="perf-ws">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+
+          <!-- Signaling -->
+          <div class="perf-card">
+            <h3>📡 Signaling</h3>
+            <div id="perf-signaling">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+
+          <!-- Path Stats -->
+          <div class="perf-card perf-card-wide">
+            <h3>📊 Path Stats (5min window)</h3>
+            <div id="perf-stats">
+              <div class="perf-loading">Chargement...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Debug Tab -->
+      <div class="tab-content" id="tab-debug">
+        <div class="tab-header">
+          <h2>🐛 Debug Mode</h2>
+          <div class="debug-controls">
+            <label class="toggle-switch">
+              <input type="checkbox" id="debug-toggle">
+              <span class="toggle-slider"></span>
+            </label>
+            <span class="debug-status-text" id="debug-status-text">OFF</span>
+            <button class="btn btn-secondary" id="btn-clear-logs">🗑️ Clear</button>
+            <button class="btn" id="btn-export-logs">📥 Export JSON</button>
+          </div>
+        </div>
+
+        <div class="debug-info-bar">
+          <div class="debug-filters">
+            <select id="debug-filter-category">
+              <option value="">Toutes les catégories</option>
+              <option value="REQUEST">REQUEST</option>
+              <option value="RESPONSE">RESPONSE</option>
+              <option value="TIMING">TIMING</option>
+              <option value="BROWSER">BROWSER</option>
+              <option value="CACHE">CACHE</option>
+              <option value="MAPPING">MAPPING</option>
+              <option value="ERROR">ERROR</option>
+              <option value="INTERNAL">INTERNAL</option>
+              <option value="ACCOUNT">ACCOUNT</option>
+              <option value="STREAM">STREAM</option>
+            </select>
+            <input type="text" id="debug-filter-search" placeholder="Rechercher dans les logs...">
+          </div>
+          <span class="debug-counter" id="debug-counter">0 / 0</span>
+        </div>
+
+        <div class="debug-log-viewer" id="debug-log-viewer">
+          <div class="empty">Activez le mode debug pour voir les logs</div>
+        </div>
+
+        <div class="pagination" id="debug-pagination"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- Detail Modal -->
+  <div class="modal" id="detail-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Détails de la requête</h3>
+        <button class="modal-close" id="modal-close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Mapping Modal -->
+  <div class="modal" id="mapping-modal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="mapping-modal-title">Ajouter un mapping</h3>
+        <button class="modal-close" id="mapping-modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <form id="mapping-form">
+          <div class="form-group">
+            <label for="mapping-source">Modèle source</label>
+            <input type="text" id="mapping-source" placeholder="gpt-4, claude-3-opus, ..." required>
+          </div>
+          <div class="form-group">
+            <label for="mapping-target">Modèle cible Qwen</label>
+            <input type="text" id="mapping-target" placeholder="qwen-plus, qwen-max, ..." required>
+          </div>
+          <div class="form-group">
+            <label>
+              <input type="checkbox" id="mapping-enabled" checked>
+              Activé
+            </label>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-secondary" id="mapping-cancel">Annuler</button>
+            <button type="submit" class="btn btn-primary">Sauvegarder</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/app.js"></script>
+  <script src="js/debug.js"></script>
+</body>
+</html>

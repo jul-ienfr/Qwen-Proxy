@@ -1,0 +1,57 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/index.js",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "webui/**",
+      "use": "@vercel/static"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/v1/(.*)",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/v1beta/(.*)",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/anthropic/(.*)",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/health",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/metrics",
+      "dest": "api/index.js"
+    },
+    {
+      "src": "/css/(.*)",
+      "dest": "/css/$1"
+    },
+    {
+      "src": "/js/(.*)",
+      "dest": "/js/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
+    }
+  ],
+  "env": {
+    "QWEN_BASE_URL": "@qwen-base-url",
+    "API_KEY": "@api-key",
+    "REDIS_URL": "@redis-url",
+    "REDIS_TOKEN": "@redis-token"
+  }
+}
