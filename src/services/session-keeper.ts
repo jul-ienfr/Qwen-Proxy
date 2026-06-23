@@ -3,6 +3,7 @@ import { accountPages, getPageForAccount, sleep } from './browser-manager.js';
 import { humanMouseMove, humanScroll, humanDelay } from './human-behavior.js';
 import { config } from '../core/config.js';
 import { isMouseLocked } from './mouse-lock.js';
+import { isAccountLaneId } from '../core/account-lanes.js';
 
 const KEEP_ALIVE_INTERVAL_MS = 3 * 60 * 1000;
 const NAVIGATION_INTERVAL_MS = 8 * 60 * 1000;
@@ -81,7 +82,7 @@ export function startSessionKeeper(): void {
         return;
       }
       // Skip lane pages (only keep alive the primary page per account)
-      if (accountId.includes('::lane-') && !accountId.endsWith('::lane-1')) continue;
+      if (isAccountLaneId(accountId)) continue;
       if (page.isClosed()) continue;
       await performKeepAlive(accountId, page);
       await sleep(humanDelay(1000, 3000));
