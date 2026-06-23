@@ -70,7 +70,7 @@ interface STSResponse {
  * Get STS token from Qwen for file upload
  * Retries once with refreshed headers if 401/RateLimited
  */
-async function getSTSToken(
+export async function getSTSToken(
   filename: string,
   filesize: number,
   filetype: string,

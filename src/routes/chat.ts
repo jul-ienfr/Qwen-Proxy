@@ -18,6 +18,7 @@ import {
   buildCompactToolManifest,
   buildToolCallContract,
 } from './tool-handler.js';
+import { obfuscateToolName, deobfuscateToolName } from '../tools/obfuscation.js';
 import { handleStreamingResponse, handleNonStreamingResponse } from './stream-handler.js';
 import { resolveSession, buildSessionContext, updateSessionState as updateSessionStateShared, releaseSessionFlight as releaseSessionFlightShared } from './request-executor.js';
 import { getPredictionCacheKey, cacheStreamingResponse, getCachedStreamingChunks, createReplayStream } from '../cache/prediction-cache.js';
@@ -175,12 +176,12 @@ export async function chatCompletions(c: Context) {
       const formattedTools = bodyAny.tools.map((t: any) => {
         if (t.type === 'function') {
           return {
-            name: t.function.name,
+            name: obfuscateToolName(t.function.name),
             description: t.function.description || '',
             parameters: t.function.parameters
           };
         }
-        return t;
+        return { ...t, name: obfuscateToolName(t.name) };
       });
 
       // Use compact tool manifest + contract (existing infrastructure)

@@ -4,6 +4,7 @@ import { StreamingToolParser } from '../tools/parser.js';
 import { QwenStreamParser } from '../utils/qwen-stream-parser.js';
 import { getIncrementalDelta, parseQwenErrorPayload } from './sse-parser.js';
 import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-handler.js';
+import { deobfuscateToolName } from '../tools/obfuscation.js';
 import { removeStream } from '../core/stream-registry.js';
 import { updateSessionParent } from '../services/qwen.js';
 import { createDirectStreamProxy, extractFast, extractJsonString } from '../services/direct-stream-proxy.js';
@@ -422,7 +423,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                               index: baseIndex + idx,
                               id: tc.id,
                               type: 'function',
-                              function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                              function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
                             }]
                           })]
                         })}\n\n`);
@@ -442,7 +443,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                           index: toolParser.getEmittedToolCallCount() - toolCalls.length + toolCalls.indexOf(tc),
                           id: tc.id,
                           type: 'function',
-                          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                          function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
                         }]
                       })]
                     })}\n\n`);
@@ -500,7 +501,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                     index: baseIndex + idx,
                     id: tc.id,
                     type: 'function',
-                    function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                    function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
                   }]
                 })]
               });
@@ -527,7 +528,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
                 index: idx,
                 id: tc.id,
                 type: 'function',
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+                function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
               }]
             })]
           });
@@ -593,7 +594,7 @@ export function handleNonStreamingResponse(
         toolCallsOut.push({
           id: tc.id,
           type: 'function',
-          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+          function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
         });
       },
     });
@@ -627,7 +628,7 @@ export function handleNonStreamingResponse(
       toolCallsOut.push({
         id: tc.id,
         type: 'function',
-        function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+        function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
       });
     }
 
@@ -636,7 +637,7 @@ export function handleNonStreamingResponse(
         toolCallsOut.push({
           id: tc.id,
           type: 'function',
-          function: { name: tc.name, arguments: JSON.stringify(tc.arguments) }
+          function: { name: deobfuscateToolName(tc.name), arguments: JSON.stringify(tc.arguments) }
         });
       }
       if (toolCallsOut.length > 0) finalContent = '';

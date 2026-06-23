@@ -16,6 +16,7 @@ import { metrics } from '../core/metrics.js';
 import { requestLogger, RequestTimer } from '../core/request-logger.js';
 import { getDebugLogger } from '../core/debug-logger.js';
 import { StreamingToolParser } from '../tools/parser.js';
+import { obfuscateToolName, deobfuscateToolName } from '../tools/obfuscation.js';
 import { resolveSession, buildSessionContext, updateSessionState, releaseSessionFlight } from './request-executor.js';
 
 // ─── Anthropic Endpoint ──────────────────────────────────────────────────────
@@ -305,7 +306,8 @@ async function handleAnthropicStream(
               if (r.text) await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: r.text } })}\n\n`);
               for (const tc of r.toolCalls) {
                 const idx = blockIndex++;
-                await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: tc.name } })}\n\n`);
+                const deobfuscatedName = deobfuscateToolName(tc.name);
+                await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: deobfuscatedName } })}\n\n`);
                 await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) } })}\n\n`);
                 await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`);
               }
@@ -330,7 +332,8 @@ async function handleAnthropicStream(
         const f = toolParser.flush();
         for (const tc of f.toolCalls) {
           const idx = blockIndex++;
-          await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: tc.name } })}\n\n`);
+          const deobfuscatedName = deobfuscateToolName(tc.name);
+          await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: deobfuscatedName } })}\n\n`);
           await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) } })}\n\n`);
           await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`);
         }
@@ -422,14 +425,17 @@ async function handleAnthropicNonStream(
     console.error('[Anthropic] Stream read error:', err?.message);
   }
 
-  // Parse tool calls from content if tools are present
+  // Parse tool calls from content if tools are present (with deobfuscation)
   let toolCalls: any[] = [];
   let textContent = fullContent;
   if (normalized.tools && normalized.tools.length > 0 && fullContent.includes('<tool_call>')) {
     const tp = new StreamingToolParser(normalized.tools as any);
     const r = tp.feed(fullContent);
     const f = tp.flush();
-    toolCalls = [...r.toolCalls, ...f.toolCalls];
+    toolCalls = [...r.toolCalls, ...f.toolCalls].map(tc => ({
+      ...tc,
+      name: deobfuscateToolName(tc.name),
+    }));
     textContent = r.text + f.text;
     console.log(`[Anthropic] Non-stream: parsed ${toolCalls.length} tool calls from ${fullContent.length} chars`);
   }
@@ -521,10 +527,10 @@ function buildPromptFromMessages(normalized: NormalizedRequest): string {
     }
   }
 
-  // Add tools to system prompt if present
+  // Add tools to system prompt if present (with obfuscation)
   if (normalized.tools && normalized.tools.length > 0) {
     const toolsJson = JSON.stringify(normalized.tools.map(t => ({
-      name: t.function.name,
+      name: obfuscateToolName(t.function.name),
       description: t.function.description,
       parameters: t.function.parameters,
     })), null, 2);
