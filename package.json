@@ -13,6 +13,7 @@
     "login:chrome": "npx tsx src/login.ts --browser=chrome",
     "login:edge": "npx tsx src/login.ts --browser=edge",
     "build": "tsc -p tsconfig.build.json",
+    "build:webui": "cd webui && npm install && npm run build",
     "test": "tsx --test src/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",

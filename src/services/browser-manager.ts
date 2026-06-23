@@ -106,6 +106,7 @@ export let activePage: Page | null = null;
 let guestContext: BrowserContext | null = null;
 let guestPage: Page | null = null;
 let guestHeadersCache: { headers: Record<string, string>, timestamp: number } | null = null;
+let chromePid: number | null = null;
 
 export function getBrowser(): Browser | null { return browser; }
 export function setBrowser(b: Browser | null) { browser = b; }
@@ -119,6 +120,64 @@ export function getGuestPage(): Page | null { return guestPage; }
 export function setGuestPage(p: Page | null) { guestPage = p; }
 export function getGuestHeadersCache(): { headers: Record<string, string>, timestamp: number } | null { return guestHeadersCache; }
 export function setGuestHeadersCache(c: { headers: Record<string, string>, timestamp: number } | null) { guestHeadersCache = c; }
+
+/**
+ * Force-kill the tracked Chrome child process.
+ * Called on exit, after browser.close() fails, or during orphan cleanup.
+ */
+export function forceKillOrphans(): void {
+  if (chromePid) {
+    try {
+      process.kill(chromePid, 'SIGTERM')
+      console.log(`[Browser] Sent SIGTERM to Chrome PID ${chromePid}`)
+    } catch (err: any) {
+      // ESRCH = already dead, which is fine
+      if (err?.code !== 'ESRCH') {
+        console.warn(`[Browser] Failed to kill Chrome PID ${chromePid}: ${err.message}`)
+      }
+    }
+    chromePid = null
+  }
+}
+
+/**
+ * Detect orphaned Chrome processes from previous runs.
+ * Logs a warning but does NOT kill them (they might be the user's own Chrome).
+ * Only logs count so the operator is aware.
+ */
+export function detectOrphanedChrome(): void {
+  try {
+    const { execSync } = require('child_process') as typeof import('child_process')
+    const isWin = process.platform === 'win32'
+    const cmd = isWin
+      ? 'tasklist /FO CSV /NH 2>nul'
+      : 'ps aux 2>/dev/null'
+    const output = execSync(cmd, { encoding: 'utf-8', timeout: 5000 })
+    const chromeLines = output.split('\n').filter(l =>
+      isWin ? l.includes('chrome.exe') : l.includes('chrome') && !l.includes('grep')
+    )
+    if (chromeLines.length > 2) {
+      console.warn(`[Browser] Detected ${chromeLines.length} Chrome processes running — some may be orphans from previous runs`)
+    }
+  } catch {
+    // Ignore — detection is best-effort
+  }
+}
+
+/**
+ * Register process.on('exit') handler to force-kill Chrome.
+ * Must be called once at startup (from index.ts).
+ * Survives taskkill /F, uncaught exceptions, and Node crashes.
+ */
+export function registerExitHandler(): void {
+  process.on('exit', () => {
+    if (chromePid) {
+      try {
+        process.kill(chromePid, 'SIGTERM')
+      } catch {}
+    }
+  })
+}
 
 export function getAccountHeaderCache(accountId: string): AccountHeaderCache {
   let cache = accountHeaderCaches.get(accountId);
@@ -212,6 +271,9 @@ export async function clearPageRuntimeState(page: Page | null): Promise<void> {
 export async function getOrLaunchBrowser(_browserType: BrowserType = 'chromium'): Promise<Browser> {
   if (browser?.isConnected()) return browser;
 
+  // Detect orphaned Chrome processes from previous runs
+  detectOrphanedChrome();
+
   console.log(`[CloakBrowser] Launching shared browser...`);
   const dbg = getDebugLogger();
   if (dbg.isEnabled()) {
@@ -228,7 +290,18 @@ export async function getOrLaunchBrowser(_browserType: BrowserType = 'chromium')
     humanize: true,
     args: getBrowserLaunchArgs(),
   });
+
+  // Track Chrome child PID for cleanup on exit
+  try {
+    const proc = (browser as any)._browserProcess;
+    if (proc?.pid) {
+      chromePid = proc.pid;
+      console.log(`[Browser] Chrome PID tracked: ${chromePid}`);
+    }
+  } catch {}
+
   browser.on('disconnected', () => {
+    chromePid = null;
     browser = null;
     context = null;
     activePage = null;
@@ -565,8 +638,17 @@ export async function closePlaywright() {
     await closePlaywrightForAccount(acctId);
   }
   if (browser?.isConnected()) {
-    await browser.close().catch(() => {});
+    try {
+      await browser.close();
+    } catch (err) {
+      console.warn(`[Browser] browser.close() failed: ${err instanceof Error ? err.message : err}`);
+      // Fallback: force-kill the Chrome process
+      forceKillOrphans();
+    }
     browser = null;
+  } else if (chromePid) {
+    // Browser exists but disconnected — still kill the Chrome process
+    forceKillOrphans();
   }
 }
 

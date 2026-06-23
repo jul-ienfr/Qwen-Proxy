@@ -22,6 +22,7 @@ import { proxyAdminApp } from '../routes/proxy-admin.js'
 import { app as debugApp } from '../routes/debug.js'
 import { app as serverConfigApp } from '../routes/server-config.js'
 import { sessionsApp } from '../routes/sessions.js'
+import { accountsApp } from '../routes/accounts.js'
 import { initDebugState, getDebugState } from '../core/debug-state.js'
 import { getDebugLogger } from '../core/debug-logger.js'
 import { registerConfigHandlers } from '../core/config-handlers.js'
@@ -113,6 +114,9 @@ app.route('', sessionsApp)
 
 // Server config (hot-reloadable)
 app.route('', serverConfigApp)
+
+// Account cooldown management
+app.route('/v1', accountsApp)
 
 app.get('/health', async (c) => {
   const accounts = loadAccounts()
@@ -286,7 +290,10 @@ app.onError((err, c) => {
 
 // ─── Static Files (WebUI) ────────────────────────────────────────────────────
 
-const WEBUI_DIR = path.resolve(process.cwd(), 'webui');
+// Prefer built React app (webui/dist/), fall back to legacy vanilla JS (webui/)
+const WEBUI_DIST = path.resolve(process.cwd(), 'webui', 'dist');
+const WEBUI_LEGACY = path.resolve(process.cwd(), 'webui');
+const WEBUI_DIR = fs.existsSync(WEBUI_DIST) ? WEBUI_DIST : WEBUI_LEGACY;
 
 // Check if webui directory exists
 const webuiExists = fs.existsSync(WEBUI_DIR);
@@ -317,11 +324,15 @@ async function serveWebuiFile(c: any, filePath: string): Promise<Response | null
 }
 
 if (webuiExists) {
-  // Serve CSS files
+  // Serve React build assets (webui/dist/assets/*)
+  app.get('/assets/:file', async (c) => {
+    return await serveWebuiFile(c, `assets/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
+  });
+  // Serve legacy CSS files
   app.get('/css/:file', async (c) => {
     return await serveWebuiFile(c, `css/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
   });
-  // Serve JS files
+  // Serve legacy JS files
   app.get('/js/:file', async (c) => {
     return await serveWebuiFile(c, `js/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
   });
@@ -459,42 +470,64 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
 
   const shutdown = async (signal: string) => {
     console.log(`[Shutdown] Received ${signal}, starting graceful shutdown...`)
-    // Stop stream warmer before anything else (prevents background requests during shutdown)
+
+    // Safety: force-exit after 10s if cleanup hangs
+    const forceExitTimer = setTimeout(() => {
+      console.error('[Shutdown] Cleanup timed out after 10s, force exiting')
+      process.exit(1)
+    }, 10_000)
+    forceExitTimer.unref()
+
     try {
-      const { stopStreamWarmer } = await import('../services/stream-warmer.js')
-      stopStreamWarmer()
-    } catch { /* ignore */ }
-    // Stop session keep-alive
-    try {
-      const { stopSessionKeeper } = await import('../services/session-keeper.js')
-      stopSessionKeeper()
-    } catch { /* ignore */ }
-    watchdog.stop()
-    metrics.stopCollection()
-    requestLogger.stop()
-    await cache.close()
-    // Shutdown TLS pool gracefully
-    try {
-      const { shutdownTLSPool } = await import('../services/tls-pool.js')
-      await shutdownTLSPool()
-    } catch { /* ignore */ }
-    // Shutdown WebSocket bridge
-    try {
-      const { shutdownWSBridge } = await import('../services/stream-ws-bridge.js')
-      shutdownWSBridge()
-    } catch { /* ignore */ }
-    // Shutdown WebSocket signaling server
-    try {
-      const { shutdownSignalingServer } = await import('../api/ws-server.js')
-      shutdownSignalingServer()
-    } catch { /* ignore */ }
-    const { closePlaywright } = await import('../services/playwright.js')
-    await closePlaywright()
-    const { closeDatabase } = await import('../core/database.js')
-    closeDatabase()
-    requestStore.close()
-    server?.close()
-    process.exit(0)
+      // Stop stream warmer before anything else (prevents background requests during shutdown)
+      try {
+        const { stopStreamWarmer } = await import('../services/stream-warmer.js')
+        stopStreamWarmer()
+      } catch { /* ignore */ }
+      // Stop session keep-alive
+      try {
+        const { stopSessionKeeper } = await import('../services/session-keeper.js')
+        stopSessionKeeper()
+      } catch { /* ignore */ }
+      watchdog.stop()
+      metrics.stopCollection()
+      requestLogger.stop()
+      await cache.close()
+      // Shutdown TLS pool gracefully
+      try {
+        const { shutdownTLSPool } = await import('../services/tls-pool.js')
+        await shutdownTLSPool()
+      } catch { /* ignore */ }
+      // Shutdown WebSocket bridge
+      try {
+        const { shutdownWSBridge } = await import('../services/stream-ws-bridge.js')
+        shutdownWSBridge()
+      } catch { /* ignore */ }
+      // Shutdown WebSocket signaling server
+      try {
+        const { shutdownSignalingServer } = await import('../api/ws-server.js')
+        shutdownSignalingServer()
+      } catch { /* ignore */ }
+      // Close Playwright (browser + contexts)
+      try {
+        const { closePlaywright } = await import('../services/playwright.js')
+        await closePlaywright()
+      } catch (err) {
+        console.error('[Shutdown] Error closing Playwright:', err)
+      }
+    } finally {
+      clearTimeout(forceExitTimer)
+      // Force-kill Chrome if closePlaywright missed anything
+      try {
+        const { forceKillOrphans } = await import('../services/browser-manager.js')
+        forceKillOrphans()
+      } catch { /* ignore */ }
+      const { closeDatabase } = await import('../core/database.js')
+      closeDatabase()
+      requestStore.close()
+      server?.close()
+      process.exit(0)
+    }
   }
 
   process.on('SIGINT', () => shutdown('SIGINT'))

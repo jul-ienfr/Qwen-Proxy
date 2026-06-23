@@ -255,7 +255,9 @@ export async function imageGenerations(c: Context) {
         return c.json(response);
       } catch (err: any) {
         if (err.status === 429 || err.code === 'RateLimited') {
-          markAccountRateLimited(account.id, 24 * 60 * 60 * 1000, 'RateLimited');
+          const hourHint = err.message?.match?.(/Wait about (\d+) hour/);
+          const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+          markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
         }
         lastError = err;
         account = getNextAvailableAccount(triedAccountIds);
@@ -356,7 +358,9 @@ export async function imageEdits(c: Context) {
         return c.json(response);
       } catch (err: any) {
         if (err.status === 429 || err.code === 'RateLimited') {
-          markAccountRateLimited(account.id, 24 * 60 * 60 * 1000, 'RateLimited');
+          const hourHint = err.message?.match?.(/Wait about (\d+) hour/);
+          const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+          markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
         }
         lastError = err;
         account = getNextAvailableAccount(triedAccountIds);

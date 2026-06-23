@@ -41,6 +41,10 @@ function cleanupCorruptedProfiles(): void {
 async function main() {
   cleanupCorruptedProfiles();
 
+  // Safety net: force-kill Chrome on process exit (survives taskkill /F, crashes, etc.)
+  const { registerExitHandler } = await import('./services/browser-manager.js')
+  registerExitHandler()
+
   if (isGuiMode) {
     // Import dynamique : tray-hook et webview ne sont chargés qu'en mode GUI
     const { startServerWithGui } = await import('./gui/index.js')

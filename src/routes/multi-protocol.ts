@@ -171,7 +171,9 @@ export async function anthropicMessages(c: Context) {
           break;
         } catch (err: any) {
           if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-            markAccountRateLimited(account.id, 24 * 60 * 60 * 1000, 'RateLimited');
+            const hourHint = err.message?.match(/Wait about (\d+) hour/);
+            const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+            markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
           }
           lastError = err;
           account = getNextAvailableAccount(triedAccountIds);
@@ -676,7 +678,9 @@ export async function geminiGenerateContent(c: Context) {
           break;
         } catch (err: any) {
           if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-            markAccountRateLimited(account.id, 24 * 60 * 60 * 1000, 'RateLimited');
+            const hourHint = err.message?.match(/Wait about (\d+) hour/);
+            const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
+            markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
           }
           lastError = err;
           account = getNextAvailableAccount(triedAccountIds);
