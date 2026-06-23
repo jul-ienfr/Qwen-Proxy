@@ -56,10 +56,11 @@ export const BROWSER_LANGUAGES = getSystemLanguages();
 function getBrowserLaunchArgs(): string[] {
   // CloakBrowser handles most stealth args via its own stealthArgs (enabled by default).
   // Only pass minimal operational args here.
+  // Note: --headless=new is NOT included here — the headless flag passed to launch()
+  // controls headless mode. Including --headless=new would conflict with headless: false.
   return Array.from(new Set([
     '--no-first-run',
     '--no-default-browser-check',
-    '--headless=new',
   ]));
 }
 

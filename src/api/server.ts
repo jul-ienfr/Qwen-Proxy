@@ -226,6 +226,7 @@ const CONFIG_HOT_RELOAD: Record<string, boolean> = {
   fastStreamProxy: true,
   directFetch: true,
   useWsBridge: true,
+  'browser.headless': true,
 };
 
 app.put('/v1/config/:key', async (c) => {
@@ -239,8 +240,7 @@ app.put('/v1/config/:key', async (c) => {
     if (typeof value !== 'boolean') {
       return c.json({ error: 'Value must be a boolean' }, 400);
     }
-    const oldValue = (config as any)[key];
-    (config as any)[key] = value;
+    const oldValue = configManager.get(key);
     configManager.updateConfig(key, value);
     console.log(`[Config] ${key}: ${oldValue} → ${value}`);
     return c.json({ key, oldValue, newValue: value, hotReloaded: CONFIG_HOT_RELOAD[key], persisted: true });
@@ -255,6 +255,7 @@ app.get('/v1/config', (c) => {
     directFetch: config.directFetch,
     useWsBridge: config.useWsBridge,
     tlsPoolSize: config.tlsPoolSize,
+    'browser.headless': config.browser.headless,
   });
 });
 
