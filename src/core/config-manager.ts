@@ -102,6 +102,12 @@ export interface AppConfig {
     resetTimeoutMs: number
     successThreshold: number
   }
+  accounts: {
+    singleAccountMode: boolean
+    singleAccountId: string
+    singleAccountEmail: string
+    lanes: number
+  }
 }
 
 // ─── Metadata Types ──────────────────────────────────────────────────────────
@@ -391,6 +397,12 @@ export class ConfigManager extends EventEmitter {
         failureThreshold: parseInt(env.CB_FAILURE_THRESHOLD),
         resetTimeoutMs: parseInt(env.CB_RESET_TIMEOUT),
         successThreshold: parseInt(env.CB_SUCCESS_THRESHOLD),
+      },
+      accounts: {
+        singleAccountMode: false,
+        singleAccountId: '',
+        singleAccountEmail: '',
+        lanes: 1,
       },
     }
   }

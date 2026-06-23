@@ -29,11 +29,47 @@ export function compactPromptText(text: string, maxChars = 180): string {
   return `${compact.slice(0, maxChars)}...`;
 }
 
+function splitToolText(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+function collectSchemaText(schema: any): string[] {
+  if (!schema || typeof schema !== 'object') return [];
+  const values: string[] = [];
+  if (typeof schema.description === 'string') values.push(schema.description);
+  if (typeof schema.title === 'string') values.push(schema.title);
+  if (typeof schema.const === 'string') values.push(schema.const);
+  if (Array.isArray(schema.enum)) values.push(...schema.enum.filter((item: unknown): item is string => typeof item === 'string'));
+  if (schema.properties && typeof schema.properties === 'object') {
+    for (const [key, value] of Object.entries(schema.properties)) {
+      values.push(key, ...collectSchemaText(value));
+    }
+  }
+  if (schema.items) values.push(...collectSchemaText(schema.items));
+  for (const key of ['anyOf', 'oneOf', 'allOf']) {
+    if (Array.isArray(schema[key])) {
+      for (const item of schema[key]) values.push(...collectSchemaText(item));
+    }
+  }
+  return values;
+}
+
 export function getForcedToolName(toolChoice: any): string {
   if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) {
     return toolChoice.function.name;
   }
   return '';
+}
+
+export function getToolChoiceMode(toolChoice: any): 'auto' | 'none' | 'required' | 'forced' {
+  if (toolChoice === 'none') return 'none';
+  if (toolChoice === 'required') return 'required';
+  if (toolChoice && typeof toolChoice === 'object' && toolChoice.function?.name) return 'forced';
+  return 'auto';
 }
 
 export function tokenizeForToolScoring(text: string): Set<string> {
@@ -89,6 +125,29 @@ export function getRecentToolNames(messages: Message[]): Set<string> {
   return recentToolNames;
 }
 
+export function isFileMutationTool(tool: FunctionToolDefinition): boolean {
+  const fn = getToolFunction(tool);
+  const schema = fn?.parameters || {};
+  const schemaText = collectSchemaText(schema);
+  const tokens = new Set(splitToolText([getToolName(tool), getToolDescription(tool), ...schemaText].join(' ')));
+  const hasFileTarget = ['file', 'files', 'path', 'filepath', 'uri', 'document', 'workspace', 'buffer'].some(token => tokens.has(token));
+  const hasMutationVerb = ['append', 'apply', 'change', 'create', 'delete', 'edit', 'insert', 'modify', 'move', 'overwrite', 'patch', 'remove', 'rename', 'replace', 'save', 'truncate', 'update', 'write'].some(token => tokens.has(token));
+  const hasMutationPayload = ['content', 'diff', 'edit', 'new', 'newtext', 'newstring', 'old', 'oldtext', 'oldstring', 'patch', 'replacement', 'text', 'value'].some(token => tokens.has(token));
+  const hasReadOnlyVerb = ['read', 'list', 'search', 'find', 'grep', 'show', 'get', 'open', 'view', 'inspect'].some(token => tokens.has(token));
+  return hasFileTarget && hasMutationVerb && (hasMutationPayload || !hasReadOnlyVerb);
+}
+
+function appendMissingFileMutationTools(selected: FunctionToolDefinition[], tools: FunctionToolDefinition[]): FunctionToolDefinition[] {
+  const selectedNames = new Set(selected.map(getToolName));
+  for (const tool of tools) {
+    const name = getToolName(tool);
+    if (!name || selectedNames.has(name) || !isFileMutationTool(tool)) continue;
+    selected.push(tool);
+    selectedNames.add(name);
+  }
+  return selected;
+}
+
 export function selectCandidateTools(
   tools: FunctionToolDefinition[],
   contextText: string,
@@ -104,10 +163,11 @@ export function selectCandidateTools(
     .sort((a, b) => b.score - a.score || getToolName(a.tool).localeCompare(getToolName(b.tool)));
 
   if (scored.length === 0) {
-    return tools.slice(0, maxTools);
+    return appendMissingFileMutationTools(tools.slice(0, maxTools), tools);
   }
 
-  return scored.slice(0, maxTools).map(entry => entry.tool);
+  const selected = scored.slice(0, maxTools).map(entry => entry.tool);
+  return appendMissingFileMutationTools(selected, tools);
 }
 
 export function buildCompactToolManifest(tools: FunctionToolDefinition[], forcedToolName = ''): string {
@@ -147,6 +207,11 @@ export function buildToolCallContract(
     ? 'You may emit multiple tool call blocks only when the user explicitly asks for multiple independent actions.'
     : 'Emit at most one tool call block.';
 
+  const fileMutationTools = tools.filter(isFileMutationTool);
+  const fileMutationSection = fileMutationTools.length > 0
+    ? `\nFile mutation tools detected: ${fileMutationTools.map(getToolName).join(', ')}\nWhen calling file mutation tools, always provide the complete file content or the precise before/after diff. Never emit a partial or ambiguous file edit.`
+    : '';
+
   return `[TOOL CALL CONTRACT - MUST FOLLOW]
 Available tool names: ${toolList}
 Format:
@@ -161,7 +226,7 @@ Rules:
 3. Do not output raw JSON as a tool call.
 4. ${forcedLine}
 5. ${parallelLine}
-6. If no tool is needed, do not emit any tool call block.`;
+6. If no tool is needed, do not emit any tool call block.${fileMutationSection}`;
 }
 
 export function parseToolArguments(value: unknown): Record<string, unknown> {

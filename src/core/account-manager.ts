@@ -1,5 +1,7 @@
 import type { QwenAccount} from './accounts.js';
 import { loadAccounts, updateAccountCooldown, invalidateAccountsCache as invalidateAccountsCacheSource } from './accounts.js'
+import { config } from './config.js'
+import { getBaseAccountId, makeAccountLaneId } from './account-lanes.js'
 
 let currentIndex = 0
 
@@ -10,17 +12,41 @@ interface CooldownEntry {
 
 const cooldowns = new Map<string, CooldownEntry>()
 
+const inUseAccounts = new Set<string>()
+
 const DEFAULT_COOLDOWN_MS = 3 * 60 * 1000
 
+function expandSingleAccountLanes(accounts: QwenAccount[]): QwenAccount[] {
+  if (!config.accounts?.singleAccountMode) return accounts
+
+  const selected = accounts.find(account => {
+    if (config.accounts?.singleAccountId) return account.id === config.accounts.singleAccountId
+    if (config.accounts?.singleAccountEmail) return account.email === config.accounts.singleAccountEmail
+    return !account.cooldown_until || account.cooldown_until <= Date.now()
+  }) || accounts[0]
+
+  if (!selected) return []
+
+  return Array.from({ length: config.accounts?.lanes || 1 }, (_, index) => ({
+    ...selected,
+    id: makeAccountLaneId(selected.id, index + 1),
+    email: `${selected.email}#lane-${index + 1}`,
+  }))
+}
+
 function getAccountsWithCooldownSync(): QwenAccount[] {
-  const accounts = loadAccounts()
+  const accounts = expandSingleAccountLanes(loadAccounts())
   const now = Date.now()
 
   for (const account of accounts) {
-    if (account.cooldown_until && account.cooldown_until > now) {
+    const baseAccountId = getBaseAccountId(account.id)
+    const cooldownUntil = account.cooldown_until || cooldowns.get(baseAccountId)?.until || 0
+    const cooldownReason = account.cooldown_reason || cooldowns.get(baseAccountId)?.reason || 'RateLimited'
+
+    if (cooldownUntil && cooldownUntil > now) {
       cooldowns.set(account.id, {
-        until: account.cooldown_until,
-        reason: account.cooldown_reason || 'RateLimited',
+        until: cooldownUntil,
+        reason: cooldownReason,
       })
     } else {
       cooldowns.delete(account.id)
@@ -35,20 +61,19 @@ export function invalidateAccountsCache(): void {
 }
 
 export function markAccountRateLimited(accountId: string, cooldownMs?: number, reason?: string): void {
+  const baseAccountId = getBaseAccountId(accountId)
   const duration = cooldownMs ?? DEFAULT_COOLDOWN_MS
   const until = Date.now() + duration
   const cooldownReason = reason ?? 'RateLimited'
 
-  cooldowns.set(accountId, {
-    until,
-    reason: cooldownReason,
-  })
+  cooldowns.set(accountId, { until, reason: cooldownReason })
+  cooldowns.set(baseAccountId, { until, reason: cooldownReason })
 
-  if (accountId !== 'global') {
+  if (baseAccountId !== 'global') {
     try {
-      updateAccountCooldown(accountId, until, cooldownReason)
+      updateAccountCooldown(baseAccountId, until, cooldownReason)
     } catch (err) {
-      console.error(`[AccountManager] Failed to save cooldown to DB for account ${accountId}:`, (err as Error).message)
+      console.error(`[AccountManager] Failed to save cooldown to DB for account ${baseAccountId}:`, (err as Error).message)
     }
   }
 
@@ -56,28 +81,28 @@ export function markAccountRateLimited(accountId: string, cooldownMs?: number, r
 }
 
 export function clearAccountCooldown(accountId: string): void {
+  const baseAccountId = getBaseAccountId(accountId)
   cooldowns.delete(accountId)
-  if (accountId !== 'global') {
+  cooldowns.delete(baseAccountId)
+  if (baseAccountId !== 'global') {
     try {
-      updateAccountCooldown(accountId, 0, null)
+      updateAccountCooldown(baseAccountId, 0, null)
     } catch (err) {
-      console.error(`[AccountManager] Failed to clear cooldown in DB for account ${accountId}:`, (err as Error).message)
+      console.error(`[AccountManager] Failed to clear cooldown in DB for account ${baseAccountId}:`, (err as Error).message)
     }
   }
 }
 
 export function getAccountCooldownInfo(accountId: string): { onCooldown: boolean; remainingMs: number; reason: string } | null {
-  const entry = cooldowns.get(accountId)
+  const baseAccountId = getBaseAccountId(accountId)
+  const entry = cooldowns.get(accountId) || cooldowns.get(baseAccountId)
   if (!entry) return null
   const remaining = entry.until - Date.now()
   if (remaining <= 0) {
     cooldowns.delete(accountId)
-    if (accountId !== 'global') {
-      try {
-        updateAccountCooldown(accountId, 0, null)
-      } catch (err) {
-        console.error(`[AccountManager] Failed to clear expired cooldown in DB:`, (err as Error).message)
-      }
+    cooldowns.delete(baseAccountId)
+    if (baseAccountId !== 'global') {
+      try { updateAccountCooldown(baseAccountId, 0, null) } catch {}
     }
     return null
   }
@@ -86,6 +111,18 @@ export function getAccountCooldownInfo(accountId: string): { onCooldown: boolean
 
 function isAccountOnCooldown(accountId: string): boolean {
   return getAccountCooldownInfo(accountId) !== null
+}
+
+function isAccountInUse(accountId: string): boolean {
+  return inUseAccounts.has(accountId)
+}
+
+export function markAccountInUse(accountId: string): void {
+  inUseAccounts.add(accountId)
+}
+
+export function releaseAccountInUse(accountId: string): void {
+  inUseAccounts.delete(accountId)
 }
 
 export function getNextAccount(forceReset?: boolean): QwenAccount | null {
@@ -101,7 +138,7 @@ export function getNextAccount(forceReset?: boolean): QwenAccount | null {
   for (let i = 0; i < accounts.length; i++) {
     const account = accounts[currentIndex % accounts.length]
     currentIndex = (currentIndex + 1) % accounts.length
-    if (!isAccountOnCooldown(account.id)) {
+    if (!isAccountOnCooldown(account.id) && !isAccountInUse(account.id)) {
       return account
     }
   }
@@ -135,7 +172,7 @@ export function getNextAvailableAccount(triedAccountIds?: Set<string> | string):
     const idx = (currentIndex + i) % accounts.length
     const account = accounts[idx]
     if (triedSet.has(account.id)) continue
-    if (!isAccountOnCooldown(account.id)) {
+    if (!isAccountOnCooldown(account.id) && !isAccountInUse(account.id)) {
       currentIndex = (idx + 1) % accounts.length
       return account
     }
@@ -168,4 +205,12 @@ export function getCooldownStatus(): Record<string, { remainingMs: number; reaso
     }
   }
   return result
+}
+
+export function getActiveAccountCount(): number {
+  return getAccountsWithCooldownSync().filter(account => !isAccountOnCooldown(account.id)).length
+}
+
+export function getInUseAccounts(): string[] {
+  return Array.from(inUseAccounts)
 }
