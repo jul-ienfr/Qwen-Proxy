@@ -7,6 +7,7 @@ import type { QwenAccount } from '../core/accounts.js';
 import { addAccount, listAccounts } from '../core/accounts.js';
 import { config } from '../core/config.js';
 import { getDebugLogger } from '../core/debug-logger.js';
+import { getFingerprintProfile } from './fingerprint.js';
 
 export type BrowserType = 'chromium' | 'firefox' | 'webkit' | 'chrome' | 'edge';
 
@@ -58,14 +59,14 @@ function getBrowserLaunchArgs(): string[] {
   return Array.from(new Set([
     '--no-first-run',
     '--no-default-browser-check',
+    '--headless=new',
   ]));
 }
 
-export function sharedContextOptions(): BrowserContextOptions {
-  // CloakBrowser handles locale, timezone, user-agent, and client hints at the C++ binary level.
-  // Only set context-level options here.
+export function sharedContextOptions(accountId?: string): BrowserContextOptions {
+  const profile = accountId ? getFingerprintProfile(accountId) : null;
   return {
-    viewport: BROWSER_VIEWPORT,
+    viewport: profile?.viewport || BROWSER_VIEWPORT,
     deviceScaleFactor: 1,
     isMobile: false,
     hasTouch: false,
@@ -93,6 +94,7 @@ export const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, 
 
 export const accountContexts = new Map<string, BrowserContext>();
 export const accountPages = new Map<string, Page>();
+export const accountLanePages = new Map<string, Page>();
 export const accountHeaderCaches = new Map<string, AccountHeaderCache>();
 export const cachedUserAgents = new Map<string, string>();
 export const cookieCaches = new Map<string, { cookie: string, timestamp: number }>();
@@ -439,6 +441,7 @@ export async function resetBrowserProfile(cacheKey: string, accountId?: string):
       cachedUserAgents.delete(cacheKey);
       accountContexts.clear();
       accountPages.clear();
+      accountLanePages.clear();
       context = null;
       activePage = null;
       guestContext = null;
@@ -467,7 +470,7 @@ export async function initPlaywright(_headless = true, browserType: BrowserType 
 
   const storageState = loadStorageState('_default');
   context = await sharedBrowser.newContext({
-    ...sharedContextOptions(),
+    ...sharedContextOptions('_default'),
     ...(storageState ? { storageState } : {}),
   });
 
@@ -571,7 +574,7 @@ export async function initPlaywrightForAccount(account: QwenAccount, _headless =
 
     const storageState = loadStorageState(account.id);
     const acctContext = await sharedBrowser.newContext({
-      ...sharedContextOptions(),
+      ...sharedContextOptions(account.id),
       ...(storageState ? { storageState } : {}),
     });
 
@@ -622,7 +625,7 @@ export async function launchManualLoginAccount(accountId: string, _browserType: 
 
   const storageState = loadStorageState(accountId);
   const acctContext = await manualBrowser.newContext({
-    ...sharedContextOptions(),
+    ...sharedContextOptions(accountId),
     ...(storageState ? { storageState } : {}),
   });
 
@@ -650,6 +653,12 @@ export async function extractAccountInfoFromContext(page: Page): Promise<{ email
 }
 
 export async function closePlaywrightForAccount(accountId: string) {
+  const lanePage = accountLanePages.get(accountId);
+  if (lanePage && !lanePage.isClosed()) {
+    await lanePage.close().catch(() => {});
+  }
+  accountLanePages.delete(accountId);
+
   const acctContext = accountContexts.get(accountId);
   const acctPage = accountPages.get(accountId);
   if (acctContext) {
@@ -666,4 +675,23 @@ export function getPageForAccount(accountId?: string): Page | null {
   if (accountId === 'guest') return guestPage;
   if (accountId && accountId !== '_default') return accountPages.get(accountId) || null;
   return activePage;
+}
+
+// ─── Concurrency Lanes ────────────────────────────────────────────────────────
+// Each account gets a dedicated lane page to avoid interference between
+// concurrent requests on the same account.
+
+export function getLanePage(accountId: string): Page | null {
+  return accountLanePages.get(accountId) || null;
+}
+
+export async function ensureLanePage(accountId: string): Promise<Page> {
+  const existing = accountLanePages.get(accountId);
+  if (existing && !existing.isClosed()) return existing;
+
+  const page = await accountPages.get(accountId)?.context()?.newPage();
+  if (page) {
+    accountLanePages.set(accountId, page);
+  }
+  return page!;
 }

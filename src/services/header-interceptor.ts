@@ -1,5 +1,6 @@
 import { config } from '../core/config.js';
 import { loadCachedHeaders, saveCachedHeaders } from './header-cache.js';
+import { humanType, humanDelay } from './human-behavior.js';
 import {
   CHROME_UA,
   HEADERS_TTL,
@@ -125,10 +126,11 @@ export async function getGuestHeaders(): Promise<Record<string, string>> {
     const sharedBrowser = await getOrLaunchBrowser('chromium');
     const storageState = loadStorageState('_guest');
     const guestCtx = await sharedBrowser.newContext({
-      ...sharedContextOptions(),
+      ...sharedContextOptions('guest'),
       ...(storageState ? { storageState } : {}),
     });
-    await guestCtx.addInitScript(getStealthScript());
+    const { getFingerprintProfile } = await import('./fingerprint.js');
+    await guestCtx.addInitScript(getStealthScript(getFingerprintProfile('guest')));
     setGuestContext(guestCtx);
     guestPage = await guestCtx.newPage();
     setGuestPage(guestPage);
@@ -194,8 +196,9 @@ export async function getGuestHeaders(): Promise<Record<string, string>> {
           await guestPage!.waitForSelector(inputSelector, { timeout: config.timeouts.page });
           await guestPage!.focus(inputSelector);
           await guestPage!.fill(inputSelector, '');
-          await guestPage!.type(inputSelector, 'a', { delay: 50 });
-          await sleep(1000);
+          await sleep(humanDelay(500, 1500));
+          await humanType(guestPage!, inputSelector, 'a');
+          await sleep(humanDelay(500, 1500));
 
           const selectors = ['.message-input-right-button-send .send-button', '.chat-prompt-send-button', 'button.send-button'];
           let clicked = false;
@@ -303,6 +306,10 @@ async function _getQwenHeadersInternal(forceNew = false, accountId?: string): Pr
     return await _getQwenHeadersInternalOnce(forceNew, accountId);
   } catch (err: any) {
     const cacheKey = accountId || 'global';
+    // Don't retry if account has no credentials — it will just fail again
+    if (err?.message?.includes('no credentials available')) {
+      throw err;
+    }
     if (!forceNew && err?.message?.includes('Timeout waiting for Qwen headers for')) {
       console.warn(`[Playwright] Header capture timed out for ${cacheKey}; clearing browser profile and retrying once...`);
       await resetBrowserProfile(cacheKey, accountId);
@@ -393,6 +400,12 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
           const { loginToQwen } = await import('./browser-manager.js');
           await loginToQwen(creds.email, creds.password);
         }
+      } else {
+        // Account has no stored credentials — cannot auto-reconnect
+        console.error(`[Playwright] Session expired for account ${cacheKey} but no password stored. Run 'npm run login' to add credentials.`);
+        const { markAccountRateLimited } = await import('../core/account-manager.js');
+        markAccountRateLimited(accountId || 'global', 24 * 60 * 60 * 1000, 'NoCredentials');
+        throw new Error(`Account ${cacheKey} session expired and no credentials available for auto-reconnect. Run 'npm run login'.`);
       }
     }
   }
@@ -485,11 +498,14 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         console.log(`[Playwright] Triggering request for ${cacheKey}...`);
         const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
 
-        await page.focus(inputSelector);
-        await page.fill(inputSelector, '');
-        await page.type(inputSelector, 'a', { delay: 100 });
+        // Wait for input to be ready before interacting
+        await page.waitForSelector(inputSelector, { timeout: 10000 }).catch(() => {});
+        await page.focus(inputSelector).catch(() => {});
+        await page.fill(inputSelector, '').catch(() => {});
+        await sleep(humanDelay(500, 1500));
+        await humanType(page, inputSelector, 'a');
         console.log(`[Playwright] Typed char for ${cacheKey}, waiting for UI to update...`);
-        await sleep(2000);
+        await sleep(humanDelay(500, 1500));
 
         const selectors = [
           '.message-input-right-button-send .send-button',

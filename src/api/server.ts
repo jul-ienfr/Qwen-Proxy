@@ -361,16 +361,17 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
     // Skip accounts already handled by initPlaywright (default session)
     const accountsToInit = accounts.filter(a => a.id !== '_default')
     if (accountsToInit.length > 0) {
-      console.log(`[Server] Pre-warming ${accountsToInit.length} configured account(s) in parallel...`)
-      await Promise.all(
-        accountsToInit.map(account => {
-          const creds = getAccountCredentials(account.id)
-          if (!creds) return Promise.resolve()
-          return initPlaywrightForAccount(creds, config.browser.headless, config.browser.type as any).catch((err: any) => {
-            console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
-          })
+      console.log(`[Server] Pre-warming ${accountsToInit.length} configured account(s) sequentially...`)
+      // Sequential init with random stagger (prevents thundering herd)
+      for (const account of accountsToInit) {
+        const creds = getAccountCredentials(account.id)
+        if (!creds) continue
+        const staggerMs = 500 + Math.floor(Math.random() * 1500);
+        await new Promise(r => setTimeout(r, staggerMs));
+        await initPlaywrightForAccount(creds, config.browser.headless, config.browser.type as any).catch((err: any) => {
+          console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
         })
-      )
+      }
     }
     console.log('[Server] Pre-fetching headers for all accounts in background...')
     const { warmAllPools } = await import('../services/qwen.js')
@@ -383,6 +384,14 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
       console.log('[Server] Stream warmer started')
     } catch (err: any) {
       console.warn('[Server] Stream warmer init failed:', err.message)
+    }
+
+    // Start session keep-alive (prevents captcha after inactivity)
+    try {
+      const { startSessionKeeper } = await import('../services/session-keeper.js')
+      startSessionKeeper()
+    } catch (err: any) {
+      console.warn('[Server] Session keeper init failed:', err.message)
     }
   }
 
@@ -426,6 +435,11 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
     try {
       const { stopStreamWarmer } = await import('../services/stream-warmer.js')
       stopStreamWarmer()
+    } catch { /* ignore */ }
+    // Stop session keep-alive
+    try {
+      const { stopSessionKeeper } = await import('../services/session-keeper.js')
+      stopSessionKeeper()
     } catch { /* ignore */ }
     watchdog.stop()
     metrics.stopCollection()

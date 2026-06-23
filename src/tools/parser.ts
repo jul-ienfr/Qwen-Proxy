@@ -466,7 +466,7 @@ export class StreamingToolParser {
 
   private parseToolContent(str: string): ParsedToolCall[] {
     const calls: ParsedToolCall[] = [];
-    
+
     // Try parsing as single JSON first
     try {
       const parsed = robustParseJSON(str);
@@ -475,13 +475,27 @@ export class StreamingToolParser {
         if (tc) calls.push(tc);
       }
     } catch { /* ignore */ }
-    
+
     // Always try line-by-line parsing for multi-JSON content (independent of single parse)
     if (str.includes('\n')) {
-      const lines = str.split('\n').map(l => l.trim()).filter(l => l.startsWith('{') && l.endsWith('}'));
+      const lines = str.split('\n').map(l => l.trim()).filter(l => l.startsWith('{'));
       for (const line of lines) {
+        // Try strict parse first for complete lines
+        if (line.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(line);
+            if (parsed && typeof parsed === 'object') {
+              const tc = this.parseToolCall(parsed);
+              if (tc && !calls.some(c => c.name === tc.name && JSON.stringify(c.arguments) === JSON.stringify(tc.arguments))) {
+                calls.push(tc);
+              }
+              continue;
+            }
+          } catch { /* fall through to robust parse */ }
+        }
+        // Use robust parse for truncated or malformed lines
         try {
-          const parsed = JSON.parse(line);
+          const parsed = robustParseJSON(line);
           if (parsed && typeof parsed === 'object') {
             const tc = this.parseToolCall(parsed);
             if (tc && !calls.some(c => c.name === tc.name && JSON.stringify(c.arguments) === JSON.stringify(tc.arguments))) {
@@ -491,7 +505,7 @@ export class StreamingToolParser {
         } catch { /* ignore */ }
       }
     }
-    
+
     return calls;
   }
 
@@ -504,7 +518,11 @@ export class StreamingToolParser {
     let args = parsed.arguments || parsed.function?.arguments || parsed.args || parsed.parameters || parsed.input || {};
     if (typeof args === 'string') {
       try { args = JSON.parse(args); }
-      catch { args = {}; }
+      catch {
+        // Attempt robust parse for truncated or malformed argument strings
+        try { args = robustParseJSON(args) || {}; }
+        catch { args = {}; }
+      }
     }
     if (typeof args !== 'object' || args === null) args = {};
 
