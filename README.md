@@ -8,6 +8,8 @@ Proxy API local compatible avec OpenAI qui route les requêtes vers les modèles
 [![Playwright](https://img.shields.io/badge/Playwright-1.60-blueviolet)](https://playwright.dev/)
 [![License: ISC](https://img.shields.io/badge/License-ISC-yellow.svg)](LICENSE)
 
+> **Projet original :** Ce projet est basé sur [pedrofariasx/qwenproxy](https://github.com/pedrofariasx/qwenproxy). Merci à Pedro Farias pour le travail initial.
+
 ---
 
 ## Fonctionnalités
