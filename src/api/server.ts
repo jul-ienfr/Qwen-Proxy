@@ -3,7 +3,7 @@ import { serve } from '@hono/node-server'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
-import { config } from '../core/config.js'
+import { config, configManager } from '../core/config.js'
 import { metrics } from '../core/metrics.js'
 import { cache } from '../cache/memory-cache.js'
 import { Watchdog } from '../core/watchdog.js'
@@ -23,13 +23,19 @@ import { initDebugState, getDebugState } from '../core/debug-state.js'
 import { getDebugLogger } from '../core/debug-logger.js'
 import { registerConfigHandlers } from '../core/config-handlers.js'
 import { RateLimiter } from '../middleware/rate-limiter.js'
+import { loadAccounts } from '../core/accounts.js'
+import { getAccountCooldownInfo } from '../core/account-manager.js'
+import { getBrowser } from '../services/browser-manager.js'
+import { getPredictionCacheStats } from '../cache/prediction-cache.js'
+import { getWarmPoolStats } from '../services/warm-pool.js'
+import { getSessionManager } from '../core/session-manager.js'
 
 const app = new Hono()
 
 let watchdog: Watchdog
 let server: any
 
-app.use('*', async (c, next) => {
+app.use('/v1/*', async (c, next) => {
   metrics.increment('requests.total')
   const start = Date.now()
   await next()
@@ -96,10 +102,6 @@ app.route('', sessionsApp)
 app.route('', serverConfigApp)
 
 app.get('/health', async (c) => {
-  const { loadAccounts } = await import('../core/accounts.js')
-  const { getAccountCooldownInfo } = await import('../core/account-manager.js')
-  const { getBrowser } = await import('../services/browser-manager.js')
-
   const accounts = loadAccounts()
   const browser = getBrowser()
 
@@ -115,6 +117,21 @@ app.get('/health', async (c) => {
       onCooldown: accounts.filter(a => getAccountCooldownInfo(a.id)).length,
     },
     cache: await cache?.getStats(),
+    cacheMemory: (() => {
+      try {
+        const predStats = getPredictionCacheStats();
+        return {
+          predictionCache: {
+            entries: predStats.entries,
+            totalSizeMB: Math.round(predStats.totalSizeBytes / 1024 / 1024 * 100) / 100,
+            maxEntries: predStats.maxEntries,
+            ttlMinutes: Math.round(predStats.ttlMs / 60000),
+          },
+        };
+      } catch {
+        return { predictionCache: null };
+      }
+    })(),
     logging: {
       enabled: requestLogger.isEnabled(),
       bufferSize: requestLogger.getBufferSize(),
@@ -126,11 +143,26 @@ app.get('/health', async (c) => {
         return getPoolStats()
       } catch { return { total: 0, alive: 0, totalRequests: 0 } }
     })(),
+    warmPool: (() => {
+      try {
+        return getWarmPoolStats();
+      } catch {
+        return {};
+      }
+    })(),
     wsBridge: await (async () => {
       try {
         const { getWSBridgeStats } = await import('../services/stream-ws-bridge.js')
         return getWSBridgeStats()
       } catch { return { serverRunning: false, port: 0, activeConnections: 0 } }
+    })(),
+    sessions: (() => {
+      try {
+        const sessionMgr = getSessionManager();
+        return sessionMgr.getStats();
+      } catch {
+        return { active: 0, sessions: [] };
+      }
     })(),
     signaling: await (async () => {
       try {
@@ -189,6 +221,43 @@ app.get('/v1/performance', async (c) => {
   })
 })
 
+// ─── Config Toggle API ──────────────────────────────────────────────────────
+const CONFIG_HOT_RELOAD: Record<string, boolean> = {
+  fastStreamProxy: true,
+  directFetch: true,
+  useWsBridge: true,
+};
+
+app.put('/v1/config/:key', async (c) => {
+  const key = c.req.param('key');
+  if (!(key in CONFIG_HOT_RELOAD)) {
+    return c.json({ error: `Unknown or non-hot-reloadable config key: ${key}`, available: Object.keys(CONFIG_HOT_RELOAD) }, 400);
+  }
+  try {
+    const body = await c.req.json();
+    const value = body.value;
+    if (typeof value !== 'boolean') {
+      return c.json({ error: 'Value must be a boolean' }, 400);
+    }
+    const oldValue = (config as any)[key];
+    (config as any)[key] = value;
+    configManager.updateConfig(key, value);
+    console.log(`[Config] ${key}: ${oldValue} → ${value}`);
+    return c.json({ key, oldValue, newValue: value, hotReloaded: CONFIG_HOT_RELOAD[key], persisted: true });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 400);
+  }
+});
+
+app.get('/v1/config', (c) => {
+  return c.json({
+    fastStreamProxy: config.fastStreamProxy,
+    directFetch: config.directFetch,
+    useWsBridge: config.useWsBridge,
+    tlsPoolSize: config.tlsPoolSize,
+  });
+});
+
 app.onError((err, c) => {
   metrics.increment('requests.errors')
   console.error('API Error:', err)
@@ -203,10 +272,10 @@ const WEBUI_DIR = path.resolve(process.cwd(), 'webui');
 const webuiExists = fs.existsSync(WEBUI_DIR);
 
 // Helper to serve static files
-function serveWebuiFile(c: any, filePath: string): any {
+async function serveWebuiFile(c: any, filePath: string): Promise<Response | null> {
   const fullPath = path.join(WEBUI_DIR, filePath);
-  if (fs.existsSync(fullPath)) {
-    const content = fs.readFileSync(fullPath);
+  try {
+    const content = await fs.promises.readFile(fullPath);
     const ext = path.extname(fullPath).toLowerCase();
     const mimeTypes: Record<string, string> = {
       '.html': 'text/html',
@@ -222,51 +291,56 @@ function serveWebuiFile(c: any, filePath: string): any {
     return new Response(content, {
       headers: { 'Content-Type': mimeTypes[ext] || 'application/octet-stream' },
     });
+  } catch {
+    return null;
   }
-  return null;
 }
 
 if (webuiExists) {
   // Serve CSS files
-  app.get('/css/:file', (c) => {
-    return serveWebuiFile(c, `css/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
+  app.get('/css/:file', async (c) => {
+    return await serveWebuiFile(c, `css/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
   });
   // Serve JS files
-  app.get('/js/:file', (c) => {
-    return serveWebuiFile(c, `js/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
+  app.get('/js/:file', async (c) => {
+    return await serveWebuiFile(c, `js/${c.req.param('file')}`) || c.json({ error: 'Not found' }, 404);
   });
   // Serve favicon
-  app.get('/favicon.ico', (c) => {
-    return serveWebuiFile(c, 'favicon.ico') || new Response(null, { status: 204 });
+  app.get('/favicon.ico', async (c) => {
+    return await serveWebuiFile(c, 'favicon.ico') || new Response(null, { status: 204 });
   });
 }
 
 // Dashboard at root (only if no API path matched)
-app.get('/', (c) => {
+app.get('/', async (c) => {
   if (webuiExists) {
     const indexPath = path.join(WEBUI_DIR, 'index.html');
-    if (fs.existsSync(indexPath)) {
-      const html = fs.readFileSync(indexPath, 'utf-8');
+    try {
+      const html = await fs.promises.readFile(indexPath, 'utf-8');
       return c.html(html);
+    } catch {
+      // index.html doesn't exist, fall through to JSON response
     }
   }
   return c.json({ message: 'QwenProxy API', version: '1.8.0' });
 })
 
-app.notFound((c) => {
+app.notFound(async (c) => {
   // Try to serve index.html for SPA routing (but not for API paths)
   const reqPath = new URL(c.req.url).pathname;
   if (webuiExists && !reqPath.startsWith('/v1/') && !reqPath.startsWith('/api/') && !reqPath.startsWith('/anthropic/') && !reqPath.startsWith('/v1beta/') && reqPath !== '/health' && reqPath !== '/metrics') {
     const indexPath = path.join(WEBUI_DIR, 'index.html');
-    if (fs.existsSync(indexPath)) {
-      const html = fs.readFileSync(indexPath, 'utf-8');
+    try {
+      const html = await fs.promises.readFile(indexPath, 'utf-8');
       return c.html(html);
+    } catch {
+      // index.html doesn't exist, fall through to 404
     }
   }
   return c.json({ error: 'Not found' }, 404)
 })
 
-export async function startServer(): Promise<void> {
+export async function startServer(onReady?: (port: number) => void): Promise<void> {
   // Initialize debug state (loads persisted state or env default)
   initDebugState()
 
@@ -275,7 +349,6 @@ export async function startServer(): Promise<void> {
 
   await cache.connect()
 
-  const { loadAccounts } = await import('../core/accounts.js')
   const accounts = loadAccounts()
 
   const { initPlaywright, initPlaywrightForAccount } = await import('../services/playwright.js')
@@ -302,6 +375,15 @@ export async function startServer(): Promise<void> {
     console.log('[Server] Pre-fetching headers for all accounts in background...')
     const { warmAllPools } = await import('../services/qwen.js')
     warmAllPools(accounts.map(a => a.id)).catch(() => {})
+
+    // Start periodic stream pre-warming (connections, headers, warm pool)
+    try {
+      const { startStreamWarmer } = await import('../services/stream-warmer.js')
+      startStreamWarmer()
+      console.log('[Server] Stream warmer started')
+    } catch (err: any) {
+      console.warn('[Server] Stream warmer init failed:', err.message)
+    }
   }
 
   watchdog = new Watchdog()
@@ -325,6 +407,9 @@ export async function startServer(): Promise<void> {
   }, async (info) => {
     console.log(`Server listening on http://${info.address}:${info.port}`)
 
+    // Notify GUI (or other listeners) that the server is ready
+    onReady?.(info.port)
+
     // Initialize WebSocket signaling server for Browser-Direct mode
     try {
       const wsServer = await import('../api/ws-server.js')
@@ -337,6 +422,11 @@ export async function startServer(): Promise<void> {
 
   const shutdown = async (signal: string) => {
     console.log(`[Shutdown] Received ${signal}, starting graceful shutdown...`)
+    // Stop stream warmer before anything else (prevents background requests during shutdown)
+    try {
+      const { stopStreamWarmer } = await import('../services/stream-warmer.js')
+      stopStreamWarmer()
+    } catch { /* ignore */ }
     watchdog.stop()
     metrics.stopCollection()
     requestLogger.stop()

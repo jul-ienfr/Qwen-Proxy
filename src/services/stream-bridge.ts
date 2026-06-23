@@ -1,7 +1,9 @@
 import type { Page } from 'playwright-core';
 import crypto from 'crypto';
 import { config } from '../core/config.js';
+import { getDebugLogger } from '../core/debug-logger.js';
 import { startCaptchaWatcher } from './captcha-solver.js';
+import { isPageHealthy } from './browser-manager.js';
 
 // ─── CDP Chunk Batching Configuration ────────────────────────────────────────
 // Batches small CDP messages into larger ones to reduce IPC overhead.
@@ -17,15 +19,62 @@ const streamCallbacks = new Map<string, {
   onBody: (body: string) => void;
 }>();
 
+const chunkCounts = new Map<string, number>();
+
 const abortControllers = new Map<string, () => void>();
 
-const pagesWithExposed = new WeakSet<Page>();
+// Store relay callback per page so we can re-inject after navigation
+const relayCallbacks = new WeakMap<Page, (reqId: string, type: string, data: any) => void>();
+
+function makeRelayCallback() {
+  return (reqId: string, type: string, data: any) => {
+    const cb = streamCallbacks.get(reqId);
+    if (!cb) return;
+    switch (type) {
+      case 'meta': cb.onMeta(data); break;
+      case 'chunk': cb.onChunk(data); break;
+      case 'end': cb.onEnd(); streamCallbacks.delete(reqId); abortControllers.delete(reqId); chunkCounts.delete(reqId); break;
+      case 'error': cb.onError(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); chunkCounts.delete(reqId); break;
+      case 'body': cb.onBody(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); chunkCounts.delete(reqId); break;
+    }
+  };
+}
 
 async function ensureStreamBridge(page: Page): Promise<void> {
-  if (pagesWithExposed.has(page)) return;
-  pagesWithExposed.add(page);
+  // Check if __streamRelay is already registered and callable
+  const hasIt = await page.evaluate(
+    () => typeof (window as any).__streamRelay === 'function'
+  ).catch(() => false);
+  if (hasIt) return; // CDP binding exists and works
 
-  // Inject __name helper via string eval (NOT transpiled by tsx, so no __name dependency)
+  // Check if we already exposed this page before (CDP binding may persist after navigation)
+  const existingCallback = relayCallbacks.get(page);
+  if (existingCallback) {
+    // CDP binding exists but window property is gone (page navigated).
+    // Re-expose using the same callback — Playwright handles "already registered"
+    // by overwriting the binding.
+    try {
+      await page.exposeFunction('__streamRelay', existingCallback);
+      return;
+    } catch {
+      // "already registered" — binding exists, just needs window property restored
+      // Inject a shim that bridges window.__streamRelay to the CDP binding
+      await page.evaluate(`(() => {
+        if (typeof window.__streamRelay !== 'function') {
+          // The CDP binding is registered but window property was lost after navigation.
+          // Calling __streamRelay will route through the CDP binding automatically.
+          // We just need to ensure the property exists for code that checks typeof.
+          Object.defineProperty(window, '__streamRelay', {
+            get() { return function() {}; }, // stub — actual calls go through CDP
+            configurable: true,
+          });
+        }
+      })()`).catch(() => {});
+      return;
+    }
+  }
+
+  // First time — inject __name helper and expose the relay
   await page.evaluate(`(() => {
     if (!window.__name) {
       window.__name = function(fn, name) {
@@ -35,17 +84,9 @@ async function ensureStreamBridge(page: Page): Promise<void> {
     }
   })()`);
 
-  await page.exposeFunction('__streamRelay', (reqId: string, type: string, data: any) => {
-    const cb = streamCallbacks.get(reqId);
-    if (!cb) return;
-    switch (type) {
-      case 'meta': cb.onMeta(data); break;
-      case 'chunk': cb.onChunk(data); break;
-      case 'end': cb.onEnd(); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
-      case 'error': cb.onError(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
-      case 'body': cb.onBody(data); streamCallbacks.delete(reqId); abortControllers.delete(reqId); break;
-    }
-  });
+  const callback = makeRelayCallback();
+  relayCallbacks.set(page, callback);
+  await page.exposeFunction('__streamRelay', callback);
 }
 
 export async function browserFetch(
@@ -58,6 +99,9 @@ export async function browserFetch(
     timeoutMs?: number;
   } = {},
 ): Promise<{ status: number; statusText: string; contentType: string; body: string; headers: Record<string, string> }> {
+  if (!(await isPageHealthy(page))) {
+    throw new Error('browserFetch failed: page is not healthy');
+  }
   await ensureStreamBridge(page);
   const reqId = crypto.randomUUID();
 
@@ -115,6 +159,9 @@ export async function browserStreamFetch(
   reqId: string;
   abort: () => void;
 }> {
+  if (!(await isPageHealthy(page))) {
+    throw new Error('browserStreamFetch failed: page is not healthy');
+  }
   await ensureStreamBridge(page);
   const reqId = crypto.randomUUID();
   const enc = new TextEncoder();
@@ -130,6 +177,7 @@ export async function browserStreamFetch(
   const metaTimeout = setTimeout(() => {
     streamCallbacks.delete(reqId);
     abortControllers.delete(reqId);
+    chunkCounts.delete(reqId);
     metaReject(new Error(`Browser stream fetch timed out waiting for response metadata after ${metaTimeoutMs}ms`));
   }, metaTimeoutMs);
 
@@ -163,6 +211,12 @@ export async function browserStreamFetch(
         const cb = streamCallbacks.get(reqId);
         if (!cb) return;
         cb.onChunk = (chunk: string) => {
+          const chunkCount = chunkCounts.get(reqId) ?? 0;
+          chunkCounts.set(reqId, chunkCount + 1);
+          const dbg = getDebugLogger();
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-bridge.ts', `CHUNK #${chunkCount} (${chunk.length}b)`, { reqId: reqId.substring(0, 8), size: chunk.length });
+          }
           try { controller.enqueue(enc.encode(chunk)); } catch { /* ignore */ }
         };
         cb.onEnd = () => {
@@ -170,17 +224,23 @@ export async function browserStreamFetch(
           bodyResolve('');
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
+          chunkCounts.delete(reqId);
         };
         cb.onError = (msg: string) => {
+          console.log(`[WSBridge] onError for ${reqId.substring(0,8)}: ${msg?.substring(0, 80)}`);
+          clearTimeout(metaTimeout);
+          metaReject(new Error(msg));
           try { controller.error(new Error(msg)); } catch { /* ignore */ }
           bodyReject(new Error(msg));
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
+          chunkCounts.delete(reqId);
         };
         cb.onBody = (text: string) => {
           bodyResolve(text);
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
+          chunkCounts.delete(reqId);
         };
 
         page.evaluate(async ({ url, options, reqId }: any) => {
@@ -205,7 +265,19 @@ export async function browserStreamFetch(
               headers: respHeaders,
             });
 
+            // Remove from abort controllers so captcha solver won't abort successful fetches
+            delete (window as any).__abortControllers[reqId];
+
             if (!resp.ok || !resp.body) {
+              const bodyText = await resp.text();
+              (window as any).__streamRelay(reqId, 'body', bodyText);
+              delete (window as any).__abortControllers[reqId];
+              return;
+            }
+
+            // If content type is not SSE, read body as text instead of streaming
+            const contentType = resp.headers.get('content-type') || '';
+            if (!contentType.includes('text/event-stream')) {
               const bodyText = await resp.text();
               (window as any).__streamRelay(reqId, 'body', bodyText);
               delete (window as any).__abortControllers[reqId];
@@ -269,6 +341,7 @@ export async function browserStreamFetch(
         }, reqId).catch(() => {});
         streamCallbacks.delete(reqId);
         abortControllers.delete(reqId);
+        chunkCounts.delete(reqId);
       },
     });
 
@@ -281,6 +354,7 @@ export async function browserStreamFetch(
       }, reqId).catch(() => {});
       streamCallbacks.delete(reqId);
       abortControllers.delete(reqId);
+      chunkCounts.delete(reqId);
     };
 
     abortControllers.set(reqId, abortFn);

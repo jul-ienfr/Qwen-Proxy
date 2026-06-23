@@ -16,6 +16,7 @@ import type { Page } from 'playwright-core';
 import crypto from 'crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { config } from '../core/config.js';
+import { getDebugLogger } from '../core/debug-logger.js';
 import { startCaptchaWatcher } from './captcha-solver.js';
 
 // ─── WebSocket Server Singleton ──────────────────────────────────────────────
@@ -27,18 +28,22 @@ let wssPort = 0;
  * Initialize the in-page WebSocket server on a random port.
  * Only called once per process.
  */
-function ensureWSS(): number {
+async function ensureWSS(): Promise<number> {
   if (wss) return wssPort;
 
-  wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
-  wssPort = (wss.address() as any)?.port || 0;
+  return new Promise<number>((resolve) => {
+    wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
 
-  wss.on('error', (err) => {
-    console.error('[WSBridge] WebSocket server error:', err.message);
+    wss.on('error', (err) => {
+      console.error('[WSBridge] WebSocket server error:', err.message);
+    });
+
+    wss.on('listening', () => {
+      wssPort = (wss!.address() as any)?.port || 0;
+      console.log(`[WSBridge] WebSocket server listening on port ${wssPort}`);
+      resolve(wssPort);
+    });
   });
-
-  console.log(`[WSBridge] WebSocket server listening on port ${wssPort}`);
-  return wssPort;
 }
 
 /**
@@ -70,6 +75,18 @@ export function getWSBridgeStats(): {
 
 // ─── Active Connections ──────────────────────────────────────────────────────
 
+const MAX_ACTIVE_CONNECTIONS = 100;
+const CONNECTION_STALE_MS = 5 * 60 * 1000; // 5 minutes
+
+function cleanupStaleConnections(): void {
+  const now = Date.now();
+  for (const [key, conn] of activeConnections.entries()) {
+    if (now - conn.createdAt > CONNECTION_STALE_MS) {
+      activeConnections.delete(key);
+    }
+  }
+}
+
 const activeConnections = new Map<string, {
   ws: WebSocket;
   metaResolve: (meta: any) => void;
@@ -78,6 +95,7 @@ const activeConnections = new Map<string, {
   endCallback: () => void;
   errorCallback: (msg: string) => void;
   bodyCallback: (body: string) => void;
+  createdAt: number;
 }>();
 
 // ─── Browser-Side WebSocket Client Injection ─────────────────────────────────
@@ -123,9 +141,14 @@ export async function browserStreamFetchWS(
   reqId: string;
   abort: () => void;
 }> {
-  const port = ensureWSS();
+  const port = await ensureWSS();
   const reqId = crypto.randomUUID();
   const enc = new TextEncoder();
+
+  // Enforce max-size guard on activeConnections
+  if (activeConnections.size >= MAX_ACTIVE_CONNECTIONS) {
+    cleanupStaleConnections();
+  }
 
   // Set up WebSocket connection handler
   const metaPromise = new Promise<{
@@ -163,7 +186,12 @@ export async function browserStreamFetchWS(
               reject(new Error(msg.message));
               break;
           }
-        } catch {}
+        } catch (err) {
+          const dbg = getDebugLogger();
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-ws-bridge.ts', 'Caught error', { error: (err as Error).message });
+          }
+        }
       };
 
       ws.on('message', messageHandler);
@@ -217,7 +245,12 @@ export async function browserStreamFetchWS(
                 activeConnections.delete(reqId);
                 break;
             }
-          } catch {}
+          } catch (err) {
+            const dbg = getDebugLogger();
+            if (dbg.isEnabled()) {
+              dbg.log('STREAM', 'stream-ws-bridge.ts', 'Caught error', { error: (err as Error).message });
+            }
+          }
         };
 
         if (wss) {

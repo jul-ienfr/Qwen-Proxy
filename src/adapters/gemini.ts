@@ -182,10 +182,16 @@ export class GeminiAdapter implements ProtocolAdapter {
     // Add function calls
     if (choice.message.tool_calls) {
       for (const tc of choice.message.tool_calls) {
+        let parsedArgs: any;
+        try {
+          parsedArgs = JSON.parse(tc.function.arguments || '{}');
+        } catch {
+          parsedArgs = {};
+        }
         parts.push({
           functionCall: {
             name: tc.function.name,
-            args: JSON.parse(tc.function.arguments || '{}'),
+            args: parsedArgs,
           },
         });
       }
@@ -234,7 +240,7 @@ export class GeminiAdapter implements ProtocolAdapter {
           parts.push({
             functionCall: {
               name: tc.function.name,
-              args: tc.function.arguments ? JSON.parse(tc.function.arguments) : {},
+              args: (() => { try { return tc.function.arguments ? JSON.parse(tc.function.arguments) : {}; } catch { return {}; } })(),
             },
           });
         }

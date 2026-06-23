@@ -24,53 +24,120 @@ interface RequestMetric {
 class PerformanceStore {
   private metrics: RequestMetric[] = [];
   private maxEntries = 10000;
+  private writeIndex = 0;
+
+  // O(1) aggregated counters per path — avoids linear scans
+  private pathStats: Record<string, {
+    latencySum: number;
+    ttfbSum: number;
+    successCount: number;
+    totalCount: number;
+    lastReset: number;
+  }> = {};
+
+  private getOrCreate(path: string) {
+    if (!this.pathStats[path]) {
+      this.pathStats[path] = {
+        latencySum: 0, ttfbSum: 0, successCount: 0,
+        totalCount: 0, lastReset: Date.now(),
+      };
+    }
+    return this.pathStats[path];
+  }
 
   add(metric: RequestMetric): void {
-    this.metrics.push(metric);
-    if (this.metrics.length > this.maxEntries) {
-      this.metrics = this.metrics.slice(-this.maxEntries);
+    if (this.metrics.length < this.maxEntries) {
+      this.metrics.push(metric);
+    } else {
+      this.metrics[this.writeIndex % this.maxEntries] = metric;
+      this.writeIndex++;
     }
+
+    // Update O(1) aggregates
+    const stats = this.getOrCreate(metric.path);
+    stats.latencySum += metric.totalLatency;
+    stats.ttfbSum += metric.ttfb;
+    stats.totalCount++;
+    if (metric.success) stats.successCount++;
   }
 
   /**
-   * Get average latency for a specific path over the last N minutes.
+   * Get average latency for a specific path — O(1) via aggregates.
+   * Uses a sliding window by resetting counters periodically.
    */
   getAverageLatency(path: RequestMetric['path'], windowMs: number = 5 * 60 * 1000): number {
+    const stats = this.pathStats[path];
+    if (!stats || stats.totalCount === 0) return Infinity;
+
+    // Reset counters if window has expired
     const now = Date.now();
-    const recent = this.metrics.filter(
-      m => m.path === path && m.success && (now - m.timestamp) < windowMs
-    );
-    if (recent.length === 0) return Infinity;
-    return recent.reduce((sum, m) => sum + m.totalLatency, 0) / recent.length;
+    if (now - stats.lastReset > windowMs) {
+      // Recompute from recent metrics
+      const recent = this.metrics.filter(
+        m => m.path === path && (now - m.timestamp) < windowMs
+      );
+      if (recent.length === 0) return Infinity;
+      stats.latencySum = recent.reduce((sum, m) => sum + m.totalLatency, 0);
+      stats.ttfbSum = recent.reduce((sum, m) => sum + m.ttfb, 0);
+      stats.successCount = recent.filter(m => m.success).length;
+      stats.totalCount = recent.length;
+      stats.lastReset = now;
+      return stats.latencySum / stats.totalCount;
+    }
+
+    return stats.latencySum / stats.totalCount;
   }
 
   /**
-   * Get average TTFB for a specific path.
+   * Get average TTFB for a specific path — O(1).
    */
   getAverageTTFB(path: RequestMetric['path'], windowMs: number = 5 * 60 * 1000): number {
+    const stats = this.pathStats[path];
+    if (!stats || stats.totalCount === 0) return Infinity;
+
     const now = Date.now();
-    const recent = this.metrics.filter(
-      m => m.path === path && m.success && (now - m.timestamp) < windowMs
-    );
-    if (recent.length === 0) return Infinity;
-    return recent.reduce((sum, m) => sum + m.ttfb, 0) / recent.length;
+    if (now - stats.lastReset > windowMs) {
+      const recent = this.metrics.filter(
+        m => m.path === path && (now - m.timestamp) < windowMs
+      );
+      if (recent.length === 0) return Infinity;
+      stats.latencySum = recent.reduce((sum, m) => sum + m.totalLatency, 0);
+      stats.ttfbSum = recent.reduce((sum, m) => sum + m.ttfb, 0);
+      stats.successCount = recent.filter(m => m.success).length;
+      stats.totalCount = recent.length;
+      stats.lastReset = now;
+      return stats.ttfbSum / stats.totalCount;
+    }
+
+    return stats.ttfbSum / stats.totalCount;
   }
 
   /**
-   * Get success rate for a specific path.
+   * Get success rate for a specific path — O(1).
    */
   getSuccessRate(path: RequestMetric['path'], windowMs: number = 5 * 60 * 1000): number {
+    const stats = this.pathStats[path];
+    if (!stats || stats.totalCount === 0) return 1;
+
     const now = Date.now();
-    const recent = this.metrics.filter(
-      m => m.path === path && (now - m.timestamp) < windowMs
-    );
-    if (recent.length === 0) return 1;
-    const successes = recent.filter(m => m.success).length;
-    return successes / recent.length;
+    if (now - stats.lastReset > windowMs) {
+      const recent = this.metrics.filter(
+        m => m.path === path && (now - m.timestamp) < windowMs
+      );
+      if (recent.length === 0) return 1;
+      stats.latencySum = recent.reduce((sum, m) => sum + m.totalLatency, 0);
+      stats.ttfbSum = recent.reduce((sum, m) => sum + m.ttfb, 0);
+      stats.successCount = recent.filter(m => m.success).length;
+      stats.totalCount = recent.length;
+      stats.lastReset = now;
+      return stats.successCount / stats.totalCount;
+    }
+
+    return stats.successCount / stats.totalCount;
   }
 
   /**
-   * Get stats for all paths.
+   * Get stats for all paths — O(1) per path.
    */
   getStats(): Record<string, {
     avgLatency: number;
@@ -80,13 +147,39 @@ class PerformanceStore {
   }> {
     const paths: RequestMetric['path'][] = ['direct', 'browser', 'ws-bridge', 'h2-pool'];
     const stats: Record<string, any> = {};
+    const now = Date.now();
 
     for (const path of paths) {
+      const s = this.pathStats[path];
+      if (!s || s.totalCount === 0) {
+        stats[path] = { avgLatency: 0, avgTTFB: 0, successRate: 100, requestCount: 0 };
+        continue;
+      }
+
+      // Check if window expired and recompute in single pass
+      if (now - s.lastReset > 5 * 60 * 1000) {
+        const recent = this.metrics.filter(
+          m => m.path === path && (now - m.timestamp) < 5 * 60 * 1000
+        );
+        if (recent.length > 0) {
+          s.latencySum = 0;
+          s.ttfbSum = 0;
+          s.successCount = 0;
+          s.totalCount = recent.length;
+          for (const m of recent) {
+            s.latencySum += m.totalLatency;
+            s.ttfbSum += m.ttfb;
+            if (m.success) s.successCount++;
+          }
+          s.lastReset = now;
+        }
+      }
+
       stats[path] = {
-        avgLatency: Math.round(this.getAverageLatency(path)),
-        avgTTFB: Math.round(this.getAverageTTFB(path)),
-        successRate: Math.round(this.getSuccessRate(path) * 100),
-        requestCount: this.metrics.filter(m => m.path === path).length,
+        avgLatency: Math.round(s.latencySum / s.totalCount),
+        avgTTFB: Math.round(s.ttfbSum / s.totalCount),
+        successRate: Math.round((s.successCount / s.totalCount) * 100),
+        requestCount: s.totalCount,
       };
     }
 
@@ -101,10 +194,10 @@ class PerformanceStore {
   }
 
   /**
-   * Get count of metrics for a specific path.
+   * Get count of metrics for a specific path — O(1).
    */
   getCountByPath(path: RequestMetric['path']): number {
-    return this.metrics.filter(m => m.path === path).length;
+    return this.pathStats[path]?.totalCount || 0;
   }
 }
 

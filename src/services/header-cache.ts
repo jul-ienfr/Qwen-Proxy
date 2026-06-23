@@ -10,12 +10,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getDebugLogger } from '../core/debug-logger.js';
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const CACHE_DIR = path.resolve(process.cwd(), 'data', 'header-cache');
 const CACHE_FILE = 'headers.json';
-const CACHE_MAX_AGE_MS = 4 * 60 * 1000; // 4 minutes (headers expire at 5 min)
+const CACHE_MAX_AGE_MS = 10 * 60 * 1000; // 10 minutes (headers expire at ~15 min in practice)
+const CACHE_FALLBACK_MAX_AGE_MS = 30 * 60 * 1000; // 30 min fallback — use stale headers rather than block
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -49,7 +51,7 @@ function getCachePath(accountId: string): string {
 
 /**
  * Load cached headers from disk for an account.
- * Returns null if cache is missing or expired.
+ * Returns null if cache is missing or expired beyond fallback threshold.
  */
 export function loadCachedHeaders(accountId: string): CachedHeaders | null {
   try {
@@ -62,15 +64,31 @@ export function loadCachedHeaders(accountId: string): CachedHeaders | null {
     const entry = cache.entries[accountId];
     if (!entry) return null;
 
-    // Check if cache is expired
     const age = Date.now() - entry.timestamp;
-    if (age > CACHE_MAX_AGE_MS) {
-      console.log(`[HeaderCache] Cache expired for ${accountId} (${Math.round(age / 1000)}s old)`);
-      return null;
+
+    // Fresh cache
+    if (age <= CACHE_MAX_AGE_MS) {
+      const dbg = getDebugLogger();
+      if (dbg.isEnabled()) {
+        dbg.log('CACHE', 'header-cache.ts', `[HeaderCache] Loaded cached headers for ${accountId} (${Math.round(age / 1000)}s old)`, { accountId, age: Math.round(age / 1000) });
+      }
+      return entry;
     }
 
-    console.log(`[HeaderCache] Loaded cached headers for ${accountId} (${Math.round(age / 1000)}s old)`);
-    return entry;
+    // Stale but within fallback window — use as-is rather than block
+    if (age <= CACHE_FALLBACK_MAX_AGE_MS) {
+      const dbg = getDebugLogger();
+      if (dbg.isEnabled()) {
+        dbg.log('CACHE', 'header-cache.ts', `[HeaderCache] Using stale cached headers for ${accountId} (${Math.round(age / 1000)}s old, fallback mode)`, { accountId, age: Math.round(age / 1000) });
+      }
+      return entry;
+    }
+
+    const dbg = getDebugLogger();
+    if (dbg.isEnabled()) {
+      dbg.log('CACHE', 'header-cache.ts', `[HeaderCache] Cache expired for ${accountId} (${Math.round(age / 1000)}s old)`, { accountId, age: Math.round(age / 1000) });
+    }
+    return null;
   } catch (err: any) {
     console.warn(`[HeaderCache] Failed to load cache for ${accountId}:`, err.message);
     return null;
@@ -106,7 +124,10 @@ export function saveCachedHeaders(accountId: string, headers: {
     fs.writeFileSync(tmpPath, JSON.stringify(cache, null, 2));
     fs.renameSync(tmpPath, cachePath);
 
-    console.log(`[HeaderCache] Saved headers for ${accountId}`);
+    const dbg = getDebugLogger();
+    if (dbg.isEnabled()) {
+      dbg.log('CACHE', 'header-cache.ts', `[HeaderCache] Saved headers for ${accountId}`, { accountId });
+    }
   } catch (err: any) {
     console.warn(`[HeaderCache] Failed to save cache for ${accountId}:`, err.message);
   }

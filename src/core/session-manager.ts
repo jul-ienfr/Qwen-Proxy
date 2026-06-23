@@ -221,10 +221,16 @@ class SessionManager {
       // The session must have fewer messages than the request
       if (session.messageCount >= messages.length) continue;
 
-      // Check if the first session.messageCount messages match
+      // Fast-path: check first message fingerprint before doing full comparison
+      const firstReqMsg = messages[0];
+      const firstReqContent = extractTextContent(firstReqMsg.content);
+      const firstFp = getMessageFingerprint(firstReqMsg.role, firstReqContent);
       const sessionFps = this.fingerprints.get(session.sessionId);
       if (!sessionFps) continue;
+      const firstStoredFp = sessionFps.get(0);
+      if (firstStoredFp !== firstFp) continue;
 
+      // Check if the first session.messageCount messages match
       let matches = true;
       for (let i = 0; i < session.messageCount; i++) {
         const reqMsg = messages[i];

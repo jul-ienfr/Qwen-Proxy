@@ -6,8 +6,9 @@ import { getIncrementalDelta, parseQwenErrorPayload } from './sse-parser.js';
 import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-handler.js';
 import { removeStream } from '../core/stream-registry.js';
 import { updateSessionParent } from '../services/qwen.js';
-import { createDirectStreamProxy, hasTMDMarker } from '../services/direct-stream-proxy.js';
+import { createDirectStreamProxy, extractFast, extractJsonString } from '../services/direct-stream-proxy.js';
 import { config } from '../core/config.js';
+import { escapeJsonStringFast } from '../utils/fast-escape.js';
 
 export interface StreamHandlerContext {
   stream: ReadableStream;
@@ -28,6 +29,7 @@ export interface StreamHandlerContext {
  * Expected improvement: 10-50x per chunk.
  */
 function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any {
+  console.log(`[FastStream] Using fast path for ${ctx.completionId} (model: ${ctx.model})`);
   const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
   if (socket && typeof socket.setNoDelay === 'function') {
     socket.setNoDelay(true);
@@ -52,6 +54,7 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
           await streamWriter.write(': keep-alive\n\n');
         } catch { clearInterval(heartbeatInterval); }
       }, 15000);
+      if (heartbeatInterval.unref) heartbeatInterval.unref();
 
       const proxyStream = createDirectStreamProxy(ctx.stream as any, {
         completionId: ctx.completionId,
@@ -59,25 +62,24 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
         hasTools: ctx.hasTools,
         uiSessionId: ctx.uiSessionId,
       }, {
-        onChunk: async (encodedBytes: Uint8Array) => {
+        onChunk: async (text: string) => {
           try {
-            // Convert Uint8Array to string for hono streaming
-            const text = new TextDecoder().decode(encodedBytes);
+            // Send usage BEFORE [DONE] to respect OpenAI SSE protocol ordering
+            if (text.includes('[DONE]')) {
+              const usageChunk = JSON.stringify({
+                id: ctx.completionId,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: ctx.model,
+                choices: [],
+                usage,
+              });
+              await streamWriter.write(`data: ${usageChunk}\n\n`);
+            }
             await streamWriter.write(text);
           } catch { /* stream closed */ }
         },
-        onDone: () => {
-          // Proxy stream already sends [DONE], just send usage
-          const usageChunk = JSON.stringify({
-            id: ctx.completionId,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: ctx.model,
-            choices: [],
-            usage,
-          });
-          streamWriter.write(`data: ${usageChunk}\n\n`);
-        },
+        onDone: () => {},
         onError: (err) => {
           console.warn(`[FastStream] Proxy error:`, err.message);
         },
@@ -102,7 +104,62 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
   });
 }
 
+/**
+ * Raw passthrough — forward Qwen SSE bytes directly with zero transformation.
+ * For clients that accept native Qwen format (langchain, custom clients).
+ * Bypasses all JSON.parse, template rewriting, and delta extraction.
+ */
+function handleRawPassthrough(c: Context, ctx: StreamHandlerContext): any {
+  const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+  if (socket && typeof socket.setNoDelay === 'function') {
+    socket.setNoDelay(true);
+  }
+
+  c.header('Content-Type', 'text/event-stream');
+  c.header('Cache-Control', 'no-cache, no-transform');
+  c.header('Connection', 'keep-alive');
+  c.header('X-Accel-Buffering', 'no');
+  if (ctx.sessionId) {
+    c.header('X-QwenProxy-Session-Id', ctx.sessionId);
+  }
+
+  return honoStream(c, async (streamWriter: any) => {
+    let heartbeatInterval: any;
+    try {
+      await streamWriter.write(': heartbeat\n\n');
+      heartbeatInterval = setInterval(async () => {
+        try {
+          await streamWriter.write(': keep-alive\n\n');
+        } catch { clearInterval(heartbeatInterval); }
+      }, 15000);
+      if (heartbeatInterval.unref) heartbeatInterval.unref();
+
+      // Direct pipe: upstream bytes → client with minimal processing
+      const reader = ctx.stream.getReader();
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        // Forward raw bytes as-is (just decode for hono writer)
+        await streamWriter.write(decoder.decode(value, { stream: true }));
+      }
+    } finally {
+      clearInterval(heartbeatInterval);
+      removeStream(ctx.completionId);
+      ctx.onStreamDone?.();
+    }
+  });
+}
+
 export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): any {
+  // ─── RAW PASSTHROUGH: Zero transformation ───────────────────────────────
+  // When client sends X-QwenProxy-Format: raw, forward Qwen SSE bytes directly
+  // with zero transformation overhead. For clients that accept native Qwen format.
+  const rawFormat = c.req.header('X-QwenProxy-Format');
+  if (rawFormat === 'raw') {
+    return handleRawPassthrough(c, ctx);
+  }
+
   // ─── FAST PATH: Zero-Copy Stream Proxy ──────────────────────────────────
   // When fastStreamProxy is enabled AND no tools are needed, use the
   // direct stream proxy for 10-50x faster chunk processing.
@@ -140,6 +197,7 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
         } catch { clearInterval(heartbeatInterval);
         }
       }, 15000);
+      if (heartbeatInterval.unref) heartbeatInterval.unref();
 
       const writeEvent = (data: any) => {
         streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -155,12 +213,12 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       const createdTimestamp = Math.floor(Date.now() / 1000);
 
       const fastWriteContent = (content: string) => {
-        const escaped = JSON.stringify(content).slice(1, -1);
+        const escaped = escapeJsonStringFast(content);
         streamWriter.write(`data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":"${ctx.model}","choices":[{"index":0,"delta":{"content":"${escaped}"},"logprobs":null,"finish_reason":null}]}\n\n`);
       };
 
       const fastWriteReasoning = (content: string) => {
-        const escaped = JSON.stringify(content).slice(1, -1);
+        const escaped = escapeJsonStringFast(content);
         streamWriter.write(`data: {"id":"${ctx.completionId}","object":"chat.completion.chunk","created":${createdTimestamp},"model":"${ctx.model}","choices":[{"index":0,"delta":{"reasoning_content":"${escaped}"},"logprobs":null,"finish_reason":null}]}\n\n`);
       };
 
@@ -182,76 +240,159 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       let targetResponseIdSet = false;
       let currentThoughtIndex = 0;
       const toolParser = ctx.hasTools ? new StreamingToolParser(ctx.tools) : null;
-      let buffer = '';
-      let bufferOffset = 0;
       let completionTokens = 0;
       let promptTokens = Math.ceil(ctx.finalPrompt.length / 3.5);
+
+      // Chunked string buffer — avoids O(n²) from repeated concatenation
+      const bufChunks: string[] = [];
+      let bufTotalLen = 0;
+      let bufConsumed = 0;
+
+      function appendToBuf(decoded: string): void {
+        bufChunks.push(decoded);
+        bufTotalLen += decoded.length;
+      }
+
+      function extractLineFromBuf(): string | null {
+        for (let ci = 0; ci < bufChunks.length; ci++) {
+          const nlIdx = bufChunks[ci].indexOf('\n');
+          if (nlIdx !== -1) {
+            let line = '';
+            for (let j = 0; j < ci; j++) line += bufChunks[j];
+            if (nlIdx > 0) line += bufChunks[ci].substring(0, nlIdx);
+            const consumedLen = line.length + 1;
+            bufConsumed += consumedLen;
+            bufChunks.splice(0, ci);
+            // Compact buffer: keep only remaining chunks
+            if (bufChunks.length > 50) {
+              bufChunks.splice(0, Math.floor(bufChunks.length / 2));
+            }
+            if (bufChunks.length > 0) bufChunks[0] = bufChunks[0].substring(nlIdx + 1);
+            bufTotalLen -= consumedLen;
+            if (bufTotalLen < 0) bufTotalLen = 0;
+            return line;
+          }
+        }
+        return null;
+      }
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        const decoded = decoder.decode(value, { stream: true });
+        appendToBuf(decoded);
 
-        while (bufferOffset < buffer.length) {
-          const newlineIdx = buffer.indexOf('\n', bufferOffset);
-          if (newlineIdx === -1) break;
-          const line = buffer.slice(bufferOffset, newlineIdx);
-          bufferOffset = newlineIdx + 1;
+        let line: string | null;
+        while ((line = extractLineFromBuf()) !== null) {
           const trimmed = line.trim();
           if (!trimmed || !trimmed.startsWith('data: ')) continue;
           const dataStr = trimmed.slice(6);
           if (dataStr === '[DONE]') {
-            streamWriter.write('data: [DONE]\n\n');
+            // Don't send [DONE] here — it will be sent after finish_reason/usage
             continue;
           }
 
           try {
-            const chunk = JSON.parse(dataStr);
-            if (chunk['response.created'] && chunk['response.created'].response_id) {
-              if (!targetResponseId) {
-                targetResponseId = chunk['response.created'].response_id;
-                targetResponseIdSet = true;
-              }
-              updateSessionParent(ctx.uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id && !targetResponseIdSet) {
-              targetResponseId = chunk.response_id;
+            // Fast path: extract content without JSON.parse for common case
+            const fast = extractFast(dataStr);
+
+            // Handle response_id
+            if (fast.responseId && !targetResponseIdSet) {
+              targetResponseId = fast.responseId;
               targetResponseIdSet = true;
-              updateSessionParent(ctx.uiSessionId, chunk.response_id);
+              updateSessionParent(ctx.uiSessionId, fast.responseId);
             }
 
-            if (chunk.usage) {
-              if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
-              if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
+            // Handle usage
+            if (fast.usage) {
+              if (fast.usage.output) completionTokens = fast.usage.output;
+              if (fast.usage.input) promptTokens = fast.usage.input;
             }
 
             let vStr = '';
             let foundStr = false;
             let isThinkingChunk = false;
 
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
-                (!targetResponseIdSet || chunk.response_id === targetResponseId)) {
-              const delta = chunk.choices[0].delta;
-              if (delta.phase === 'thinking_summary') {
-                isThinkingChunk = true;
-                if (delta.extra?.summary_thought?.content) {
-                  const thoughts = delta.extra.summary_thought.content;
-                  if (thoughts.length > currentThoughtIndex) {
-                    vStr = thoughts.slice(currentThoughtIndex).join('\n');
-                    currentThoughtIndex = thoughts.length;
-                    foundStr = true;
+            // Fast path for answer content (no JSON.parse)
+            if (fast.content !== null) {
+              if (!targetResponseIdSet) {
+                // Extract response_id from data if not yet set
+                const ridIdx = dataStr.indexOf('"response_id":"');
+                if (ridIdx !== -1) {
+                  const rid = extractJsonString(dataStr, ridIdx + 15);
+                  if (rid) {
+                    targetResponseId = rid;
+                    targetResponseIdSet = true;
                   }
                 }
-              } else if (delta.phase === 'answer') {
-                isThinkingChunk = false;
-                if (delta.content !== undefined) {
-                  const newContent = delta.content || '';
-                  const result = getIncrementalDelta(lastFullContent, newContent, contentLength, contentSuffix);
-                  vStr = result.delta;
-                  if (vStr) {
-                    lastFullContent = result.matchedContent;
-                    contentLength = result.contentLength;
-                    contentSuffix = result.contentSuffix;
-                    foundStr = true;
+              }
+
+              // Content chunks are always for the current target in Qwen streams
+              const result = getIncrementalDelta(lastFullContent, fast.content, contentLength, contentSuffix);
+              vStr = result.delta;
+              if (vStr) {
+                lastFullContent = result.matchedContent;
+                contentLength = result.contentLength;
+                contentSuffix = result.contentSuffix;
+                foundStr = true;
+              }
+            } else if (fast.thinking !== null) {
+              // Fast path for thinking — need full parse for array structure
+              const chunk = JSON.parse(dataStr);
+              const delta = chunk.choices?.[0]?.delta;
+              if (delta?.extra?.summary_thought?.content) {
+                isThinkingChunk = true;
+                const thoughts = delta.extra.summary_thought.content;
+                if (thoughts.length > currentThoughtIndex) {
+                  vStr = thoughts.slice(currentThoughtIndex).join('\n');
+                  currentThoughtIndex = thoughts.length;
+                  foundStr = true;
+                }
+              }
+            } else if (fast.needsFullParse) {
+              // Fallback to full JSON.parse for complex chunks
+              const chunk = JSON.parse(dataStr);
+
+              if (chunk['response.created'] && chunk['response.created'].response_id) {
+                if (!targetResponseId) {
+                  targetResponseId = chunk['response.created'].response_id;
+                  targetResponseIdSet = true;
+                }
+                updateSessionParent(ctx.uiSessionId, chunk['response.created'].response_id);
+              } else if (chunk.response_id && !targetResponseIdSet) {
+                targetResponseId = chunk.response_id;
+                targetResponseIdSet = true;
+                updateSessionParent(ctx.uiSessionId, chunk.response_id);
+              }
+
+              if (chunk.usage) {
+                if (chunk.usage.output_tokens) completionTokens = chunk.usage.output_tokens;
+                if (chunk.usage.input_tokens) promptTokens = chunk.usage.input_tokens;
+              }
+
+              if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta &&
+                  (!targetResponseIdSet || chunk.response_id === targetResponseId)) {
+                const delta = chunk.choices[0].delta;
+                if (delta.phase === 'thinking_summary') {
+                  isThinkingChunk = true;
+                  if (delta.extra?.summary_thought?.content) {
+                    const thoughts = delta.extra.summary_thought.content;
+                    if (thoughts.length > currentThoughtIndex) {
+                      vStr = thoughts.slice(currentThoughtIndex).join('\n');
+                      currentThoughtIndex = thoughts.length;
+                      foundStr = true;
+                    }
+                  }
+                } else if (delta.phase === 'answer') {
+                  if (delta.content !== undefined) {
+                    const result = getIncrementalDelta(lastFullContent, delta.content, contentLength, contentSuffix);
+                    vStr = result.delta;
+                    if (vStr) {
+                      lastFullContent = result.matchedContent;
+                      contentLength = result.contentLength;
+                      contentSuffix = result.contentSuffix;
+                      foundStr = true;
+                    }
                   }
                 }
               }
@@ -317,14 +458,11 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
             }
           }
         }
-
-        if (bufferOffset > 0) {
-          buffer = buffer.slice(bufferOffset);
-          bufferOffset = 0;
-        }
       }
 
-      const upstreamError = parseQwenErrorPayload(buffer);
+      // Get remaining buffer content for error checking
+      const remainingBuffer = bufChunks.join('');
+      const upstreamError = parseQwenErrorPayload(remainingBuffer);
       if (upstreamError) {
         writeEvent({
           id: ctx.completionId,

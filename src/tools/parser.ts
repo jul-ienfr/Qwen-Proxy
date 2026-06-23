@@ -252,6 +252,9 @@ export class StreamingToolParser {
 
   feed(chunk: string): ParserResult {
     this.buffer += chunk;
+    if (this.buffer.length > 10000 && !this.insideTool) {
+      this.buffer = this.buffer.slice(-2000);
+    }
     const result: ParserResult = { text: '', toolCalls: [] };
 
     while (this.buffer.length > 0) {

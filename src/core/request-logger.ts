@@ -58,6 +58,18 @@ export interface RequestLog {
   /** Request duration in milliseconds */
   durationMs: number;
 
+  // Timing phases
+  /** Time to first byte (ms) — only for streaming */
+  ttfbMs?: number;
+  /** Time spent in account selection (ms) */
+  accountSelectionMs?: number;
+  /** Time spent creating stream (ms) */
+  streamCreationMs?: number;
+  /** Number of accounts tried */
+  accountsAttempted?: number;
+  /** Whether this was a cache hit */
+  cacheHit?: boolean;
+
   // Status
   /** Whether request succeeded */
   success: boolean;
@@ -103,6 +115,13 @@ export interface RequestStats {
   avgDurationMs: number;
   /** Cache hit rate (0-1) */
   cacheHitRate: number;
+
+  /** Streaming stats */
+  streaming: {
+    avgTtfbMs: number;
+    cacheHitRate: number;
+    avgAccountsAttempted: number;
+  };
 
   /** Stats by model */
   byModel: Record<string, {
@@ -217,6 +236,31 @@ export class RequestLogger {
    */
   isEnabled(): boolean {
     return this.enabled;
+  }
+}
+
+// ─── RequestTimer ────────────────────────────────────────────────────────────
+
+export class RequestTimer {
+  private startTime: number;
+  private milestones: Map<string, number> = new Map();
+
+  constructor() {
+    this.startTime = Date.now();
+  }
+
+  mark(name: string): void {
+    this.milestones.set(name, Date.now());
+  }
+
+  elapsed(name: string): number {
+    const start = this.milestones.get(name);
+    if (!start) return 0;
+    return Date.now() - start;
+  }
+
+  totalMs(): number {
+    return Date.now() - this.startTime;
   }
 }
 

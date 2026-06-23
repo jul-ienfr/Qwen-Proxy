@@ -60,6 +60,7 @@ export interface AppConfig {
   directFetch: boolean
   fastStreamProxy: boolean
   tlsPoolSize: number
+  tlsH2Enabled: boolean
   useWsBridge: boolean
   qwen: {
     baseUrl: string
@@ -91,6 +92,15 @@ export interface AppConfig {
     maxSessions: number
     autoDetect: boolean
     headerRefreshMs: number
+  }
+  rateLimit: {
+    windowMs: number
+    maxRequests: number
+  }
+  circuitBreaker: {
+    failureThreshold: number
+    resetTimeoutMs: number
+    successThreshold: number
   }
 }
 
@@ -156,6 +166,7 @@ const CONFIG_METADATA: Record<string, FieldMetadata> = {
   'directFetch': { category: 'general', hotReloadable: true, requiresRestart: false, description: 'Utiliser fetch direct Node.js (true) ou navigateur (false)' },
   'fastStreamProxy': { category: 'performance', hotReloadable: true, requiresRestart: false, description: 'Activer le proxy SSE zero-copy (gain 10-50x par chunk)' },
   'tlsPoolSize': { category: 'performance', hotReloadable: true, requiresRestart: false, description: 'Taille du pool de connexions TLS pré-établies' },
+  'tlsH2Enabled': { category: 'performance', hotReloadable: true, requiresRestart: true, description: 'Activer HTTP/2 pour les connexions TLS (désactiver si le serveur ne le supporte pas)' },
   'useWsBridge': { category: 'performance', hotReloadable: true, requiresRestart: false, description: 'Utiliser le WebSocket in-page au lieu du CDP bridge (gain 50-200x)' },
 
   // API Key
@@ -185,6 +196,15 @@ const CONFIG_METADATA: Record<string, FieldMetadata> = {
   'session.maxSessions': { category: 'session', hotReloadable: true, requiresRestart: false, description: 'Nombre maximum de sessions concurrentes' },
   'session.autoDetect': { category: 'session', hotReloadable: true, requiresRestart: false, description: 'Auto-détecter les sessions par comparaison de messages' },
   'session.headerRefreshMs': { category: 'session', hotReloadable: true, requiresRestart: false, description: 'Délai avant refresh des headers (ms)' },
+
+  // Rate Limiting
+  'rateLimit.windowMs': { category: 'rateLimit', hotReloadable: true, requiresRestart: false, description: 'Fenêtre glissante de rate limiting (ms)' },
+  'rateLimit.maxRequests': { category: 'rateLimit', hotReloadable: true, requiresRestart: false, description: 'Nombre max de requêtes par fenêtre glissante' },
+
+  // Circuit Breaker
+  'circuitBreaker.failureThreshold': { category: 'circuitBreaker', hotReloadable: true, requiresRestart: false, description: 'Seuil d\'échecs avant ouverture du circuit' },
+  'circuitBreaker.resetTimeoutMs': { category: 'circuitBreaker', hotReloadable: true, requiresRestart: false, description: 'Timeout avant tentative half-open (ms)' },
+  'circuitBreaker.successThreshold': { category: 'circuitBreaker', hotReloadable: true, requiresRestart: false, description: 'Seuil de succès pour fermer le circuit' },
 }
 
 // ─── ConfigManager Class ─────────────────────────────────────────────────────
@@ -249,6 +269,7 @@ export class ConfigManager extends EventEmitter {
       DIRECT_FETCH: z.string().default('true'),
       FAST_STREAM_PROXY: z.string().default('true'),
       TLS_POOL_SIZE: z.string().default('5'),
+      TLS_H2_ENABLED: z.string().default('true'),
       USE_WS_BRIDGE: z.string().default('false'),
       USE_HTTP3: z.string().default('false'),
       WARM_POOL_SIZE: z.string().default('10'),
@@ -270,6 +291,11 @@ export class ConfigManager extends EventEmitter {
       SESSION_MAX: z.string().default('200'),
       SESSION_AUTO_DETECT: z.string().default('true'),
       SESSION_HEADER_REFRESH: z.string().default('210000'),
+      RATE_LIMIT_WINDOW: z.string().default('60000'),
+      RATE_LIMIT_MAX: z.string().default('100'),
+      CB_FAILURE_THRESHOLD: z.string().default('5'),
+      CB_RESET_TIMEOUT: z.string().default('60000'),
+      CB_SUCCESS_THRESHOLD: z.string().default('3'),
     })
 
     const env = envSchema.parse(process.env)
@@ -324,6 +350,7 @@ export class ConfigManager extends EventEmitter {
       directFetch: env.DIRECT_FETCH === 'true',
       fastStreamProxy: env.FAST_STREAM_PROXY === 'true',
       tlsPoolSize: parseInt(env.TLS_POOL_SIZE),
+      tlsH2Enabled: env.TLS_H2_ENABLED !== 'false',
       useWsBridge: env.USE_WS_BRIDGE === 'true',
       qwen: {
         baseUrl: env.QWEN_BASE_URL,
@@ -355,6 +382,15 @@ export class ConfigManager extends EventEmitter {
         maxSessions: parseInt(env.SESSION_MAX),
         autoDetect: env.SESSION_AUTO_DETECT === 'true',
         headerRefreshMs: parseInt(env.SESSION_HEADER_REFRESH),
+      },
+      rateLimit: {
+        windowMs: parseInt(env.RATE_LIMIT_WINDOW),
+        maxRequests: parseInt(env.RATE_LIMIT_MAX),
+      },
+      circuitBreaker: {
+        failureThreshold: parseInt(env.CB_FAILURE_THRESHOLD),
+        resetTimeoutMs: parseInt(env.CB_RESET_TIMEOUT),
+        successThreshold: parseInt(env.CB_SUCCESS_THRESHOLD),
       },
     }
   }
@@ -569,7 +605,7 @@ export class ConfigManager extends EventEmitter {
         }
       }
 
-      if (path.endsWith('Timeout') || path.endsWith('Interval') || path.endsWith('TTL')) {
+      if (path.endsWith('Timeout') || path.endsWith('Interval')) {
         if (value < 1000) {
           return { success: false, error: `Value must be at least 1000ms` }
         }

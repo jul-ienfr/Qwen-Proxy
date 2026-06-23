@@ -3,6 +3,7 @@
  */
 
 import { getDebugLogger } from './debug-logger.js';
+import { configManager } from './config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -35,10 +36,11 @@ export class CircuitBreaker {
 
   constructor(name: string, config: Partial<CircuitBreakerConfig> = {}) {
     this.name = name;
+    const cfg = configManager.config.circuitBreaker;
     this.config = {
-      failureThreshold: config.failureThreshold || 5,
-      resetTimeoutMs: config.resetTimeoutMs || 60000,
-      successThreshold: config.successThreshold || 3,
+      failureThreshold: config.failureThreshold || cfg?.failureThreshold || 5,
+      resetTimeoutMs: config.resetTimeoutMs || cfg?.resetTimeoutMs || 60000,
+      successThreshold: config.successThreshold || cfg?.successThreshold || 3,
       monitorIntervalMs: config.monitorIntervalMs || 1000,
     };
   }

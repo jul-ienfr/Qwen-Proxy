@@ -225,11 +225,17 @@ export class AnthropicAdapter implements ProtocolAdapter {
     // Add tool calls
     if (choice.message.tool_calls) {
       for (const tc of choice.message.tool_calls) {
+        let parsedInput: any;
+        try {
+          parsedInput = JSON.parse(tc.function.arguments || '{}');
+        } catch {
+          parsedInput = {};
+        }
         content.push({
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: JSON.parse(tc.function.arguments || '{}'),
+          input: parsedInput,
         });
       }
     }
@@ -361,6 +367,7 @@ export class AnthropicAdapter implements ProtocolAdapter {
       case 'stop': return 'end_turn';
       case 'length': return 'max_tokens';
       case 'tool_calls': return 'tool_use';
+      case 'tool_use': return 'tool_use';
       default: return 'end_turn';
     }
   }

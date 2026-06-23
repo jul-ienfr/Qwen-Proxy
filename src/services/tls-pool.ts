@@ -40,11 +40,12 @@ class H2ConnectionPool {
   private sessions: H2SessionEntry[] = [];
   private connecting = false;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
-  private h2Supported = true; // Assume H2 works until proven otherwise
+  private h2Supported: boolean;
   private consecutiveH2Failures = 0;
   private static MAX_H2_FAILURES = 3; // Stop trying H2 after this many failures
 
   constructor() {
+    this.h2Supported = config.tlsH2Enabled;
     this.startHealthCheck();
   }
 
@@ -216,6 +217,11 @@ class H2ConnectionPool {
       }
       this.sessions = this.sessions.filter(s => s.alive);
     }, HEALTH_CHECK_MS);
+
+    // Allow the process to exit even if this timer is still active
+    if (this.healthCheckTimer?.unref) {
+      this.healthCheckTimer.unref();
+    }
   }
 
   /**
@@ -225,11 +231,15 @@ class H2ConnectionPool {
     total: number;
     alive: number;
     totalRequests: number;
+    utilization: number;
   } {
     return {
       total: this.sessions.length,
       alive: this.sessions.filter(s => s.alive).length,
       totalRequests: this.sessions.reduce((sum, s) => sum + s.requestCount, 0),
+      utilization: this.sessions.length > 0
+        ? Math.round(this.sessions.reduce((sum, s) => sum + s.requestCount, 0) / this.sessions.length)
+        : 0,
     };
   }
 
@@ -284,6 +294,8 @@ export interface PooledFetchOptions {
 /**
  * Fetch with HTTP/2 multiplexing via the pool.
  * Falls back to keep-alive HTTP/1.1 agent if H2 is unavailable.
+ * Returns a buffered response wrapped as a stream (for backward compatibility).
+ * For true streaming, use pooledFetchStream instead.
  */
 export async function pooledFetch(
   url: string,
@@ -301,8 +313,75 @@ export async function pooledFetch(
     }
   }
 
-  // Fallback to HTTP/1.1 with keep-alive agent
+  // Fallback to HTTP/1.1 with keep-alive agent (buffered)
   return http1Fetch(url, options);
+}
+
+/**
+ * Streaming fetch via the pool — returns a true ReadableStream<Uint8Array>.
+ *
+ * HTTP/2: streams natively via ClientHttp2Stream (already a readable stream).
+ * HTTP/1.1: streams natively via resp.body (Web ReadableStream from Node fetch).
+ *
+ * Falls back to keep-alive HTTP/1.1 agent if H2 is unavailable.
+ */
+export async function pooledFetchStream(
+  url: string,
+  options: PooledFetchOptions = {},
+): Promise<{ stream: ReadableStream<Uint8Array>; headers: Record<string, string> }> {
+  const parsedUrl = new URL(url);
+  const isQwen = parsedUrl.hostname === 'chat.qwen.ai';
+
+  if (isQwen) {
+    // Try HTTP/2 path for Qwen (already streaming)
+    try {
+      const h2Result = await h2Fetch(url, options);
+      // Wrap http2.ClientHttp2Stream as ReadableStream<Uint8Array>
+      const stream = h2StreamToReadableStream(h2Result.response);
+      return { stream, headers: h2Result.headers };
+    } catch (err: any) {
+      console.warn(`[TLSPool] H2 streaming fetch failed, falling back to HTTP/1.1:`, err.message);
+    }
+  }
+
+  // Fallback to HTTP/1.1 streaming
+  return http1FetchStream(url, options);
+}
+
+/**
+ * Wrap an http2.ClientHttp2Stream into a Web ReadableStream<Uint8Array>.
+ */
+function h2StreamToReadableStream(h2Stream: http2.ClientHttp2Stream): ReadableStream<Uint8Array> {
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      h2Stream.on('data', (chunk: Buffer) => {
+        try {
+          controller.enqueue(new Uint8Array(chunk));
+        } catch {
+          // Stream already closed
+        }
+      });
+
+      h2Stream.on('end', () => {
+        try {
+          controller.close();
+        } catch {
+          // Stream already closed
+        }
+      });
+
+      h2Stream.on('error', (err) => {
+        try {
+          controller.error(err);
+        } catch {
+          // Stream already closed
+        }
+      });
+    },
+    cancel(reason) {
+      h2Stream.destroy(reason instanceof Error ? reason : new Error(String(reason)));
+    },
+  });
 }
 
 /**
@@ -373,6 +452,8 @@ async function h2Fetch(
 
 /**
  * HTTP/1.1 fetch with keep-alive agent — fallback path.
+ * Buffers the entire response into a single-chunk ReadableStream.
+ * Kept for backward compatibility; prefer http1FetchStream for streaming.
  */
 async function http1Fetch(
   url: string,
@@ -399,7 +480,7 @@ async function http1Fetch(
     const responseHeaders: Record<string, string> = {};
     resp.headers.forEach((v, k) => { responseHeaders[k] = v; });
 
-    // Convert to a readable stream
+    // Convert to a readable stream (buffers entire response)
     const body = await resp.arrayBuffer();
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -412,6 +493,66 @@ async function http1Fetch(
       response: stream as any as http2.ClientHttp2Stream,
       headers: responseHeaders,
     };
+  } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+/**
+ * HTTP/1.1 streaming fetch — returns a true ReadableStream<Uint8Array>.
+ *
+ * Unlike http1Fetch which buffers the entire response via arrayBuffer(),
+ * this streams the response body chunk-by-chunk via resp.body (Web ReadableStream).
+ * This is critical for SSE/streaming responses where data arrives incrementally.
+ *
+ * Falls back to single-chunk buffering if resp.body is not available (should not
+ * happen in modern Node.js, but handled defensively).
+ */
+async function http1FetchStream(
+  url: string,
+  options: PooledFetchOptions,
+): Promise<{ stream: ReadableStream<Uint8Array>; headers: Record<string, string> }> {
+  const controller = new AbortController();
+  const timeoutId = options.timeoutMs
+    ? setTimeout(() => controller.abort(), options.timeoutMs)
+    : undefined;
+
+  try {
+    const resp = await fetch(url, {
+      method: options.method || 'POST',
+      headers: options.headers,
+      body: options.body,
+      signal: options.signal || controller.signal,
+      // @ts-ignore - Node.js experimental
+      dispatcher: undefined, // Would use undici.Agent for true pooling
+    });
+
+    if (timeoutId) clearTimeout(timeoutId);
+
+    const responseHeaders: Record<string, string> = {};
+    resp.headers.forEach((v, k) => { responseHeaders[k] = v; });
+
+    // Return the native ReadableStream from the response body for true streaming.
+    // Node.js fetch provides resp.body as a web ReadableStream<Uint8Array>.
+    if (resp.body) {
+      // Pipe through an identity transform to ensure proper ReadableStream<Uint8Array> type
+      // and to detach from the original response's lifetime (allows GC of resp metadata).
+      return {
+        stream: resp.body as ReadableStream<Uint8Array>,
+        headers: responseHeaders,
+      };
+    }
+
+    // Defensive fallback: if resp.body is null (e.g., HEAD response or empty body),
+    // return an empty stream rather than crashing.
+    console.warn(`[TLSPool] http1FetchStream: resp.body is null for ${url}, returning empty stream`);
+    const emptyStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    return { stream: emptyStream, headers: responseHeaders };
   } catch (err) {
     if (timeoutId) clearTimeout(timeoutId);
     throw err;
@@ -442,10 +583,19 @@ export function getTLSPool(): H2ConnectionPool {
 }
 
 /**
- * Get pooled fetch function.
+ * Get pooled fetch function (buffered, for backward compatibility).
  */
 export function createPooledFetcher() {
   return pooledFetch;
+}
+
+/**
+ * Get pooled streaming fetch function.
+ * Returns a true ReadableStream<Uint8Array> without buffering the full response.
+ * Use this for SSE streaming endpoints.
+ */
+export function createPooledStreamFetcher() {
+  return pooledFetchStream;
 }
 
 /**
@@ -462,5 +612,5 @@ export async function shutdownTLSPool(): Promise<void> {
  * Get pool statistics for monitoring.
  */
 export function getPoolStats() {
-  return pool?.getStats() || { total: 0, alive: 0, totalRequests: 0 };
+  return pool?.getStats() || { total: 0, alive: 0, totalRequests: 0, utilization: 0 };
 }

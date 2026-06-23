@@ -26,8 +26,23 @@ const WARM_POOL_SIZE = parseInt(process.env.WARM_POOL_SIZE || '10', 10);
 const WARM_POOL_TTL_MS = 10 * 60 * 1000;
 const WARM_POOL_LOW_WATER = parseInt(process.env.WARM_POOL_LOW_WATER || '3', 10);
 const HEADERS_TTL_MS = 4 * 60 * 1000; // Headers valid for 4 min (browser TTL is 5 min)
-const WARM_POOL_PARALLEL = parseInt(process.env.WARM_POOL_PARALLEL || '3', 10); // Parallel chat creation
-const WARM_POOL_DELAY_MS = parseInt(process.env.WARM_POOL_DELAY_MS || '500', 10); // Delay between creations
+const WARM_POOL_PARALLEL = parseInt(process.env.WARM_POOL_PARALLEL || '8', 10); // Parallel chat creation
+const WARM_POOL_DELAY_MS = parseInt(process.env.WARM_POOL_DELAY_MS || '100', 10); // Delay between creations
+const WARM_POOL_PROACTIVE_THRESHOLD = Math.floor(WARM_POOL_SIZE * 0.7); // Proactive refill at 70%
+
+let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+
+const CLEANUP_INTERVAL_MS = 60_000; // Clean every 60 seconds
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 function cleanupStalePool(accountId: string) {
   const pool = warmPool.get(accountId);
@@ -35,6 +50,28 @@ function cleanupStalePool(accountId: string) {
   const now = Date.now();
   const filtered = pool.filter(e => now - e.timestamp <= WARM_POOL_TTL_MS);
   if (filtered.length !== pool.length) warmPool.set(accountId, filtered);
+}
+
+function startCleanup(): void {
+  if (cleanupTimer) return;
+  cleanupTimer = setInterval(() => {
+    for (const [accountId, pool] of warmPool.entries()) {
+      const before = pool.length;
+      cleanupStalePool(accountId);
+      const removed = before - pool.length;
+      if (removed > 0) {
+        console.log(`[WarmPool] Cleanup: removed ${removed} stale entries for ${accountId}`);
+      }
+    }
+  }, CLEANUP_INTERVAL_MS);
+  if (cleanupTimer.unref) cleanupTimer.unref();
+}
+
+export function stopCleanup(): void {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
 }
 
 function warmChatKey(accountId: string, chatId: string) {
@@ -319,7 +356,8 @@ export async function getWarmedChat(accountId?: string) {
   if (!pool) { pool = []; warmPool.set(key, pool); }
   cleanupStalePool(key);
 
-  if (pool.length < WARM_POOL_LOW_WATER && !refillPromises.has(key)) {
+  // Proactive refill: when pool drops below 70% of target, fire a background refill
+  if (pool.length < WARM_POOL_PROACTIVE_THRESHOLD && !refillPromises.has(key)) {
     refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
   }
 
@@ -327,14 +365,14 @@ export async function getWarmedChat(accountId?: string) {
     if (!refillPromises.has(key)) {
       refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
     }
-    await refillPromises.get(key);
+    await withTimeout(refillPromises.get(key)!, config.timeouts.http, `Warm pool refill for ${key}`);
   }
   if (pool.length === 0) {
     await new Promise(r => setTimeout(r, 200));
     if (!refillPromises.has(key)) {
       refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
     }
-    await refillPromises.get(key);
+    await withTimeout(refillPromises.get(key)!, config.timeouts.http, `Warm pool refill for ${key}`);
   }
   if (pool.length === 0) throw new Error(`Warm pool empty after retry for ${key}`);
 
@@ -349,7 +387,7 @@ export async function getWarmedChat(accountId?: string) {
     if (!refillPromises.has(key)) {
       refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
     }
-    await refillPromises.get(key);
+    await withTimeout(refillPromises.get(key)!, config.timeouts.http, `Warm pool refill for ${key}`);
   }
   if (pool.length === 0) throw new Error(`Warm pool empty after discarding stale entries for ${key}`);
 
@@ -360,4 +398,14 @@ export async function getWarmedChat(accountId?: string) {
 
 export async function warmAllPools(accountIds: string[]) {
   for (const id of accountIds) refillPoolForAccount(id).catch(() => {});
+  startCleanup();
+}
+
+export function getWarmPoolStats(): Record<string, { size: number; inFlight: number }> {
+  const stats: Record<string, { size: number; inFlight: number }> = {};
+  for (const [accountId, pool] of warmPool.entries()) {
+    const inFlightCount = Array.from(inFlightWarmChats).filter(k => k.startsWith(accountId + ':')).length;
+    stats[accountId] = { size: pool.length, inFlight: inFlightCount };
+  }
+  return stats;
 }

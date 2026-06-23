@@ -11,6 +11,8 @@
 import { ReadableStream } from 'stream/web';
 import { updateSessionParent } from './qwen.js';
 import { QwenUpstreamError } from './error-handler.js';
+import { getIncrementalDelta } from '../routes/sse-parser.js';
+import { escapeJsonStringFast } from '../utils/fast-escape.js';
 
 // ─── Pre-computed Templates ──────────────────────────────────────────────────
 
@@ -36,73 +38,198 @@ const DATA_DONE = 'data: [DONE]\n\n';
 const HEARTBEAT = ': heartbeat\n\n';
 const KEEPALIVE = ': keep-alive\n\n';
 
-// ─── Fast JSON String Escaper ────────────────────────────────────────────────
+// ─── Fast Content Extractor (No JSON.parse) ──────────────────────────────────
 
-// Optimized JSON string escaping — avoids full JSON.stringify overhead
-// Only escapes the characters that matter for SSE content fields
-const ESCAPE_MAP: Record<string, string> = {
-  '\\': '\\\\',
-  '"': '\\"',
-  '\n': '\\n',
-  '\r': '\\r',
-  '\t': '\\t',
-  '\b': '\\b',
-  '\f': '\\f',
-};
-
-const ESCAPE_REGEX = /[\\"\n\r\t\b\f]/g;
-
-function escapeJsonStringFast(str: string): string {
-  if (str.length === 0) return str;
-  // Fast path: check if escaping is needed at all
-  if (!ESCAPE_REGEX.test(str)) return str;
-  return str.replace(ESCAPE_REGEX, (ch) => ESCAPE_MAP[ch] || ch);
+export interface FastExtractResult {
+  content: string | null;      // delta content (answer phase)
+  thinking: string | null;     // thinking content (thinking_summary phase)
+  responseId: string | null;   // response_id if present
+  usage: { input: number; output: number } | null;
+  isDone: boolean;
+  needsFullParse: boolean;     // true if fast path couldn't handle it
 }
 
-// ─── Zero-Copy Buffer Writer ─────────────────────────────────────────────────
+const ANSWER_MARKER = /"phase"\s*:\s*"answer"/;
+const THINKING_MARKER = /"phase"\s*:\s*"thinking_summary"/;
+const CONTENT_KEY_REGEX = /"content"\s*:\s*"/;
+const CONTENT_KEY_LEN = 11; // length of '"content": "'
+const RESPONSE_ID_KEY = '"response_id":"';
+const RESPONSE_CREATED_KEY = '"response.created":{';
+const USAGE_MARKER = '"usage":{';
+
+/**
+ * Extract content from Qwen SSE data without JSON.parse.
+ * Handles the 90%+ common case (answer delta chunks) with zero object allocation.
+ * Falls back to full parse for complex chunks.
+ */
+export function extractFast(dataStr: string): FastExtractResult {
+  const result: FastExtractResult = {
+    content: null, thinking: null, responseId: null,
+    usage: null, isDone: false, needsFullParse: false,
+  };
+
+  // Quick check: is this an answer or thinking chunk?
+  const hasAnswer = ANSWER_MARKER.test(dataStr);
+  const hasThinking = !hasAnswer && THINKING_MARKER.test(dataStr);
+
+  if (!hasAnswer && !hasThinking) {
+    // Not a delta chunk — check for response_id, usage, or other metadata
+    // Try fast response_id extraction
+    const ridIdx = dataStr.indexOf(RESPONSE_ID_KEY);
+    if (ridIdx !== -1) {
+      result.responseId = extractJsonString(dataStr, ridIdx + RESPONSE_ID_KEY.length);
+    }
+
+    // Check for usage
+    const usageIdx = dataStr.indexOf(USAGE_MARKER);
+    if (usageIdx !== -1) {
+      result.usage = extractUsageFast(dataStr, usageIdx);
+    }
+
+    // If we found nothing useful, signal full parse needed
+    if (!result.responseId && !result.usage) {
+      result.needsFullParse = true;
+    }
+    return result;
+  }
+
+  // Extract the content field
+  const contentMatch = CONTENT_KEY_REGEX.exec(dataStr);
+  if (!contentMatch) {
+    // No content field — might be a thinking chunk with different structure
+    result.needsFullParse = true;
+    return result;
+  }
+
+  const contentIdx = contentMatch.index + contentMatch[0].length;
+  const value = extractJsonString(dataStr, contentIdx);
+  if (value === null) {
+    result.needsFullParse = true;
+    return result;
+  }
+
+  if (hasAnswer) {
+    result.content = value;
+  } else {
+    result.thinking = value;
+  }
+
+  // Also try to grab response_id if present (usually in same chunk)
+  const ridIdx = dataStr.indexOf(RESPONSE_ID_KEY);
+  if (ridIdx !== -1) {
+    result.responseId = extractJsonString(dataStr, ridIdx + RESPONSE_ID_KEY.length);
+  }
+
+  return result;
+}
+
+/**
+ * Extract a JSON string value starting at the given position (after opening quote).
+ * Handles escape sequences: \\, \", \n, \r, \t, \b, \f
+ * Returns null on malformed input.
+ */
+export function extractJsonString(data: string, start: number): string | null {
+  let result = '';
+  let i = start;
+  const len = data.length;
+
+  while (i < len) {
+    const ch = data.charCodeAt(i);
+
+    if (ch === 0x22) { // closing "
+      return result;
+    } else if (ch === 0x5C) { // backslash
+      if (i + 1 >= len) return null;
+      const esc = data.charCodeAt(i + 1);
+      switch (esc) {
+        case 0x22: result += '"'; break;   // \"
+        case 0x5C: result += '\\'; break;  // \\
+        case 0x6E: result += '\n'; break;  // \n
+        case 0x72: result += '\r'; break;  // \r
+        case 0x74: result += '\t'; break;  // \t
+        case 0x62: result += '\b'; break;  // \b
+        case 0x66: result += '\f'; break;  // \f
+        case 0x75: { // \uXXXX
+          if (i + 5 >= len) return null;
+          const hex = data.substring(i + 2, i + 6);
+          const code = parseInt(hex, 16);
+          if (isNaN(code)) return null;
+          result += String.fromCharCode(code);
+          i += 4; // extra skip for hex digits
+          break;
+        }
+        default: result += data[i + 1]; break;
+      }
+      i += 2;
+    } else {
+      result += data[i];
+      i++;
+    }
+  }
+  return null; // unterminated string
+}
+
+/**
+ * Fast usage extraction — scan for input_tokens and output_tokens.
+ */
+function extractUsageFast(data: string, usageStart: number): { input: number; output: number } | null {
+  const inputIdx = data.indexOf('"input_tokens":', usageStart);
+  const outputIdx = data.indexOf('"output_tokens":', usageStart);
+  if (inputIdx === -1 || outputIdx === -1) return null;
+
+  const inputVal = extractJsonNumber(data, inputIdx + 15);
+  const outputVal = extractJsonNumber(data, outputIdx + 16);
+  if (inputVal === null || outputVal === null) return null;
+
+  return { input: inputVal, output: outputVal };
+}
+
+/**
+ * Extract a number value at position (no allocation).
+ */
+function extractJsonNumber(data: string, start: number): number | null {
+  let i = start;
+  while (i < data.length && data.charCodeAt(i) === 0x20) i++; // skip spaces
+  let numStr = '';
+  while (i < data.length) {
+    const ch = data.charCodeAt(i);
+    if (ch >= 0x30 && ch <= 0x39) { // 0-9
+      numStr += data[i];
+      i++;
+    } else {
+      break;
+    }
+  }
+  if (numStr.length === 0) return null;
+  return parseInt(numStr, 10);
+}
+
+// ─── String Buffer Writer ─────────────────────────────────────────────────────
 
 class FastBufferWriter {
-  private chunks: Uint8Array[] = [];
-  private totalSize = 0;
-
-  // Pre-allocated TextEncoder for zero-copy encoding
-  private static encoder = new TextEncoder();
+  private parts: string[] = [];
+  private totalLen = 0;
 
   reset(): void {
-    this.chunks = [];
-    this.totalSize = 0;
+    this.parts.length = 0;
+    this.totalLen = 0;
   }
 
   writeRaw(str: string): void {
-    const buf = FastBufferWriter.encoder.encode(str);
-    this.chunks.push(buf);
-    this.totalSize += buf.length;
+    this.parts.push(str);
+    this.totalLen += str.length;
   }
 
   writeEncoded(str: string): void {
-    // For content that needs JSON escaping
     const escaped = escapeJsonStringFast(str);
-    const buf = FastBufferWriter.encoder.encode(escaped);
-    this.chunks.push(buf);
-    this.totalSize += buf.length;
+    this.parts.push(escaped);
+    this.totalLen += escaped.length;
   }
 
-  writeBytes(bytes: Uint8Array): void {
-    this.chunks.push(bytes);
-    this.totalSize += bytes.length;
-  }
-
-  toArrayBuffer(): Uint8Array {
-    if (this.chunks.length === 0) return new Uint8Array(0);
-    if (this.chunks.length === 1) return this.chunks[0];
-
-    const result = new Uint8Array(this.totalSize);
-    let offset = 0;
-    for (const chunk of this.chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
+  toString(): string {
+    if (this.parts.length === 0) return '';
+    if (this.parts.length === 1) return this.parts[0];
+    return this.parts.join('');
   }
 }
 
@@ -152,7 +279,7 @@ interface TransformState {
 }
 
 export interface StreamTransformCallbacks {
-  onChunk: (encodedBytes: Uint8Array) => void;
+  onChunk: (text: string) => void;
   onError: (error: Error) => void;
   onDone: () => void;
   onUsage?: (promptTokens: number, completionTokens: number) => void;
@@ -185,10 +312,69 @@ export function createDirectStreamProxy(
   };
 
   const writer = new FastBufferWriter();
+  const decoder = new TextDecoder();
   let sourceReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  let buffer = '';
-  let bufferOffset = 0;
-  let initialized = false;
+
+  // Chunked string buffer — avoids O(n²) from repeated string concatenation + slicing
+  // Stores decoded strings in an array; extracts lines by scanning across chunks
+  const bufChunks: string[] = [];
+  let bufTotalLen = 0;
+  let bufConsumed = 0; // total chars consumed across all chunks
+
+  function appendToBuffer(decoded: string): void {
+    bufChunks.push(decoded);
+    bufTotalLen += decoded.length;
+  }
+
+  function extractLine(): string | null {
+    // Find newline across chunks without concatenation
+    let scanned = 0;
+    for (let ci = 0; ci < bufChunks.length; ci++) {
+      const chunk = bufChunks[ci];
+      const nlIdx = chunk.indexOf('\n');
+      if (nlIdx !== -1) {
+        // Found newline in this chunk — build line from partial chunks
+        let line = '';
+        // Append complete chunks before this one
+        for (let j = 0; j < ci; j++) {
+          line += bufChunks[j];
+        }
+        // Append partial from this chunk (before newline)
+        if (nlIdx > 0) line += chunk.substring(0, nlIdx);
+
+        // consumed = line.length + 1 (for the newline)
+        const consumedLen = line.length + 1;
+        bufConsumed += consumedLen;
+
+        // Remove consumed chunks
+        const removeUpTo = ci; // remove chunks 0..ci-1 entirely
+        if (removeUpTo > 0) {
+          bufChunks.splice(0, removeUpTo);
+        }
+        // Trim the start of the remaining first chunk
+        if (bufChunks.length > 0) {
+          bufChunks[0] = bufChunks[0].substring(nlIdx + 1);
+        }
+        bufTotalLen -= consumedLen;
+        if (bufTotalLen < 0) bufTotalLen = 0;
+
+        return line;
+      }
+    }
+    return null; // no complete line yet
+  }
+
+  function compactBuffer(): void {
+    // Only compact when we've consumed a lot relative to what's left
+    if (bufConsumed < 65536 && bufChunks.length < 100) return;
+    if (bufChunks.length === 0) return;
+    // Merge all remaining chunks into one
+    const merged = bufChunks.join('');
+    bufChunks.length = 0;
+    bufChunks.push(merged);
+    bufTotalLen = merged.length;
+    bufConsumed = 0;
+  }
 
   return new ReadableStream<Uint8Array>({
     start() {
@@ -203,27 +389,22 @@ export function createDirectStreamProxy(
       writer.writeRaw(ROLE_MODEL);
       writer.writeRaw(state.model);
       writer.writeRaw(ROLE_SUFFIX);
-      callbacks.onChunk(writer.toArrayBuffer());
+      callbacks.onChunk(writer.toString());
     },
 
     async pull(controller) {
       try {
         if (!sourceReader) throw new Error('Source reader not initialized');
-        const decoder = new TextDecoder();
 
         while (true) {
           const { done, value } = await sourceReader.read();
           if (done) break;
 
-          buffer += decoder.decode(value, { stream: true });
+          appendToBuffer(decoder.decode(value, { stream: true }));
 
-          while (bufferOffset < buffer.length) {
-            const newlineIdx = buffer.indexOf('\n', bufferOffset);
-            if (newlineIdx === -1) break;
-
-            const line = buffer.slice(bufferOffset, newlineIdx);
-            bufferOffset = newlineIdx + 1;
-
+          // Extract and process complete lines
+          let line: string | null;
+          while ((line = extractLine()) !== null) {
             const parsed = parseSSELine(line);
             if (parsed.type !== 'data') continue;
 
@@ -231,7 +412,7 @@ export function createDirectStreamProxy(
 
             // TMD marker detection on first data chunk
             if (!state.targetResponseIdSet) {
-              const textBytes = new TextEncoder().encode(dataStr);
+              const textBytes = tmdEncoder.encode(dataStr);
               if (hasTMDMarker(textBytes)) {
                 const tmdErr = new QwenUpstreamError(
                   `TMD anti-bot challenge detected in fast stream: ${dataStr.slice(0, 100)}`,
@@ -246,7 +427,7 @@ export function createDirectStreamProxy(
             if (dataStr === '[DONE]') {
               writer.reset();
               writer.writeRaw(DATA_DONE);
-              controller.enqueue(writer.toArrayBuffer());
+              callbacks.onChunk(writer.toString());
               controller.close();
               callbacks.onDone();
               return;
@@ -254,108 +435,122 @@ export function createDirectStreamProxy(
 
             // Fast inline parsing — avoid full JSON.parse when possible
             try {
-              const chunk = JSON.parse(dataStr);
+              const fast = extractFast(dataStr);
 
-              // Handle response.created
-              if (chunk['response.created']?.response_id) {
-                if (!state.targetResponseId) {
-                  state.targetResponseId = chunk['response.created'].response_id;
-                  state.targetResponseIdSet = true;
-                  updateSessionParent(ctx.uiSessionId, state.targetResponseId);
-                }
-              } else if (chunk.response_id && !state.targetResponseIdSet) {
-                state.targetResponseId = chunk.response_id;
+              // DEBUG: Log what extractFast found
+
+              // Handle response_id from fast extraction
+              if (fast.responseId && !state.targetResponseIdSet) {
+                state.targetResponseId = fast.responseId;
                 state.targetResponseIdSet = true;
                 updateSessionParent(ctx.uiSessionId, state.targetResponseId);
               }
 
-              // Handle usage
-              if (chunk.usage) {
-                callbacks.onUsage?.(
-                  chunk.usage.input_tokens || 0,
-                  chunk.usage.output_tokens || 0
-                );
+              // Handle usage from fast extraction
+              if (fast.usage) {
+                callbacks.onUsage?.(fast.usage.input, fast.usage.output);
               }
 
-              // Handle delta content
-              if (chunk.choices?.[0]?.delta) {
-                const delta = chunk.choices[0].delta;
-                const isTargetResponse = !state.targetResponseIdSet || chunk.response_id === state.targetResponseId;
+              // Fast path for common answer content (no JSON.parse!)
+              if (fast.content !== null) {
+                // Filter by target response ID
+                if (state.targetResponseIdSet) {
+                  if (fast.responseId && fast.responseId !== state.targetResponseId) continue;
+                }
 
-                if (isTargetResponse) {
-                  if (delta.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
-                    const thoughts = delta.extra.summary_thought.content;
-                    if (thoughts.length > state.currentThoughtIndex) {
-                      const newThoughts = thoughts.slice(state.currentThoughtIndex).join('\n');
-                      state.currentThoughtIndex = thoughts.length;
+                const newContent = fast.content;
+                const result = getIncrementalDelta(
+                  state.lastFullContent, newContent,
+                  state.contentLength, state.contentSuffix
+                );
+                const deltaStr = result.delta;
+                state.lastFullContent = result.matchedContent;
+                state.contentLength = result.contentLength;
+                state.contentSuffix = result.contentSuffix;
 
-                      writer.reset();
-                      writer.writeRaw(`data: ${REASONING_PREFIX}`);
-                      writer.writeRaw(state.completionId);
-                      writer.writeRaw(REASONING_MIDDLE_1);
-                      writer.writeRaw(String(state.createdTimestamp));
-                      writer.writeRaw(REASONING_MIDDLE_2);
-                      writer.writeRaw(state.model);
-                      writer.writeRaw(REASONING_MIDDLE_3);
-                      writer.writeEncoded(newThoughts);
-                      writer.writeRaw(REASONING_SUFFIX);
-                      controller.enqueue(writer.toArrayBuffer());
-                    }
-                  } else if (delta.phase === 'answer' && delta.content !== undefined) {
-                    const newContent = delta.content || '';
+                if (deltaStr && deltaStr !== 'FINISHED') {
+                  writer.reset();
+                  writer.writeRaw(`data: ${CONTENT_PREFIX}`);
+                  writer.writeRaw(state.completionId);
+                  writer.writeRaw(CONTENT_MIDDLE_1);
+                  writer.writeRaw(String(state.createdTimestamp));
+                  writer.writeRaw(CONTENT_MIDDLE_2);
+                  writer.writeRaw(state.model);
+                  writer.writeRaw(CONTENT_MIDDLE_3);
+                  writer.writeEncoded(deltaStr);
+                  writer.writeRaw(CONTENT_SUFFIX);
+                  callbacks.onChunk(writer.toString());
+                }
+                continue;
+              }
 
-                    // Fast incremental delta extraction
-                    let deltaStr = '';
-                    if (!state.lastFullContent) {
-                      deltaStr = newContent;
-                      state.lastFullContent = newContent;
-                      state.contentLength = newContent.length;
-                      state.contentSuffix = newContent.slice(-64);
-                    } else if (newContent.length > state.contentLength && state.contentLength > 0) {
-                      deltaStr = newContent.slice(state.contentLength);
-                      state.lastFullContent = newContent;
-                      state.contentLength = newContent.length;
-                      state.contentSuffix = newContent.slice(-64);
-                    } else if (newContent !== state.lastFullContent) {
-                      // Content changed but not appended — full re-sync
-                      deltaStr = newContent;
-                      state.lastFullContent = newContent;
-                      state.contentLength = newContent.length;
-                      state.contentSuffix = newContent.slice(-64);
-                    }
+              // Fast path for thinking content (no JSON.parse!)
+              if (fast.thinking !== null) {
+                const thoughts = fast.thinking;
+                // For thinking, we need the full array structure — fall back to parse
+                // But we can still avoid full parse if we just need the content
+                const chunk = JSON.parse(dataStr);
+                const delta = chunk.choices?.[0]?.delta;
+                if (delta?.extra?.summary_thought?.content) {
+                  const thoughtArr = delta.extra.summary_thought.content;
+                  if (thoughtArr.length > state.currentThoughtIndex) {
+                    const newThoughts = thoughtArr.slice(state.currentThoughtIndex).join('\n');
+                    state.currentThoughtIndex = thoughtArr.length;
 
-                    if (deltaStr && deltaStr !== 'FINISHED') {
-                      writer.reset();
-                      writer.writeRaw(`data: ${CONTENT_PREFIX}`);
-                      writer.writeRaw(state.completionId);
-                      writer.writeRaw(CONTENT_MIDDLE_1);
-                      writer.writeRaw(String(state.createdTimestamp));
-                      writer.writeRaw(CONTENT_MIDDLE_2);
-                      writer.writeRaw(state.model);
-                      writer.writeRaw(CONTENT_MIDDLE_3);
-                      writer.writeEncoded(deltaStr);
-                      writer.writeRaw(CONTENT_SUFFIX);
-                      controller.enqueue(writer.toArrayBuffer());
-                    }
+                    writer.reset();
+                    writer.writeRaw(`data: ${REASONING_PREFIX}`);
+                    writer.writeRaw(state.completionId);
+                    writer.writeRaw(REASONING_MIDDLE_1);
+                    writer.writeRaw(String(state.createdTimestamp));
+                    writer.writeRaw(REASONING_MIDDLE_2);
+                    writer.writeRaw(state.model);
+                    writer.writeRaw(REASONING_MIDDLE_3);
+                    writer.writeEncoded(newThoughts);
+                    writer.writeRaw(REASONING_SUFFIX);
+                    callbacks.onChunk(writer.toString());
                   }
                 }
+                continue;
               }
-            } catch {
-              // Skip malformed chunks silently — performance over logging
+
+              // Fallback: full JSON.parse for complex chunks
+              if (fast.needsFullParse) {
+                const chunk = JSON.parse(dataStr);
+
+                // Handle response.created
+                if (chunk['response.created']?.response_id) {
+                  if (!state.targetResponseId) {
+                    state.targetResponseId = chunk['response.created'].response_id;
+                    state.targetResponseIdSet = true;
+                    updateSessionParent(ctx.uiSessionId, state.targetResponseId);
+                  }
+                } else if (chunk.response_id && !state.targetResponseIdSet) {
+                  state.targetResponseId = chunk.response_id;
+                  state.targetResponseIdSet = true;
+                  updateSessionParent(ctx.uiSessionId, state.targetResponseId);
+                }
+
+                // Handle usage
+                if (chunk.usage) {
+                  callbacks.onUsage?.(
+                    chunk.usage.input_tokens || 0,
+                    chunk.usage.output_tokens || 0
+                  );
+                }
+              }
+            } catch (e: any) {
+              console.error(`[FastProxy] Parse error on chunk (${dataStr.length} chars): ${e.message?.substring(0, 150)}`);
             }
           }
 
-          // Compact buffer
-          if (bufferOffset > 0) {
-            buffer = buffer.slice(bufferOffset);
-            bufferOffset = 0;
-          }
+          // Compact buffer when consumed portion is large
+          compactBuffer();
         }
 
         // Send [DONE]
         writer.reset();
         writer.writeRaw(DATA_DONE);
-        controller.enqueue(writer.toArrayBuffer());
+        callbacks.onChunk(writer.toString());
         controller.close();
         callbacks.onDone();
 
@@ -373,6 +568,8 @@ export function createDirectStreamProxy(
 
 // ─── Fast TMD Detection ──────────────────────────────────────────────────────
 
+const tmdEncoder = new TextEncoder();
+
 const TMD_MARKERS_BYTES = [
   new Uint8Array([0x46, 0x41, 0x49, 0x4C, 0x5F, 0x53, 0x59, 0x53, 0x5F, 0x55, 0x53, 0x45, 0x52, 0x5F, 0x56, 0x41, 0x4C, 0x49, 0x44, 0x41, 0x54, 0x45]), // FAIL_SYS_USER_VALIDATE
   new Uint8Array([0x5F, 0x5F, 0x5F, 0x5F, 0x5F, 0x74, 0x6D, 0x64, 0x5F, 0x5F, 0x5F, 0x5F, 0x5F]), // _____tmd_____
@@ -382,7 +579,7 @@ const TMD_MARKERS_BYTES = [
 /**
  * Byte-level TMD marker detection — avoids string conversion for first-chunk check.
  */
-export function hasTMDMarker(bytes: Uint8Array): boolean {
+function hasTMDMarker(bytes: Uint8Array): boolean {
   for (const marker of TMD_MARKERS_BYTES) {
     if (bytes.length < marker.length) continue;
     const limit = bytes.length - marker.length;

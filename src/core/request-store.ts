@@ -67,7 +67,12 @@ export class RequestStore {
           account_id TEXT,
           account_email TEXT,
           matched_by TEXT,
-          route_id TEXT
+          route_id TEXT,
+          ttfb_ms INTEGER,
+          account_selection_ms INTEGER,
+          stream_creation_ms INTEGER,
+          accounts_attempted INTEGER,
+          cache_hit INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_timestamp ON request_logs(timestamp);
@@ -77,6 +82,18 @@ export class RequestStore {
         CREATE INDEX IF NOT EXISTS idx_account_id ON request_logs(account_id);
         CREATE INDEX IF NOT EXISTS idx_protocol ON request_logs(protocol);
       `);
+
+      // Add new columns if they don't exist (migration for existing databases)
+      const migrateColumns = [
+        'ALTER TABLE request_logs ADD COLUMN ttfb_ms INTEGER',
+        'ALTER TABLE request_logs ADD COLUMN account_selection_ms INTEGER',
+        'ALTER TABLE request_logs ADD COLUMN stream_creation_ms INTEGER',
+        'ALTER TABLE request_logs ADD COLUMN accounts_attempted INTEGER',
+        'ALTER TABLE request_logs ADD COLUMN cache_hit INTEGER',
+      ];
+      for (const stmt of migrateColumns) {
+        try { this.db.exec(stmt); } catch { /* column already exists */ }
+      }
 
       this.initialized = true;
       console.log(`[RequestStore] Initialized at ${this.dbPath}`);
@@ -100,14 +117,16 @@ export class RequestStore {
           tool_names, stream_mode, input_tokens, output_tokens, cache_tokens,
           total_tokens, start_time, end_time, duration_ms, success,
           status_code, error_code, error_message, account_id, account_email,
-          matched_by, route_id
+          matched_by, route_id, ttfb_ms, account_selection_ms, stream_creation_ms,
+          accounts_attempted, cache_hit
         ) VALUES (
           @id, @timestamp, @originalModel, @mappedModel, @protocol, @endpoint,
           @clientIp, @userAgent, @thinking, @thinkingEffort, @hasTools,
           @toolNames, @streamMode, @inputTokens, @outputTokens, @cacheTokens,
           @totalTokens, @startTime, @endTime, @durationMs, @success,
           @statusCode, @errorCode, @errorMessage, @accountId, @accountEmail,
-          @matchedBy, @routeId
+          @matchedBy, @routeId, @ttfbMs, @accountSelectionMs, @streamCreationMs,
+          @accountsAttempted, @cacheHit
         )
       `);
 
@@ -140,6 +159,11 @@ export class RequestStore {
         accountEmail: entry.accountEmail || null,
         matchedBy: entry.matchedBy || null,
         routeId: entry.routeId || null,
+        ttfbMs: entry.ttfbMs ?? null,
+        accountSelectionMs: entry.accountSelectionMs ?? null,
+        streamCreationMs: entry.streamCreationMs ?? null,
+        accountsAttempted: entry.accountsAttempted ?? null,
+        cacheHit: entry.cacheHit != null ? (entry.cacheHit ? 1 : 0) : null,
       });
     } catch (err: any) {
       console.error(`[RequestStore] Failed to log request: ${err.message}`);
@@ -242,6 +266,11 @@ export class RequestStore {
       accountEmail: row.account_email,
       matchedBy: row.matched_by,
       routeId: row.route_id,
+      ttfbMs: row.ttfb_ms ?? undefined,
+      accountSelectionMs: row.account_selection_ms ?? undefined,
+      streamCreationMs: row.stream_creation_ms ?? undefined,
+      accountsAttempted: row.accounts_attempted ?? undefined,
+      cacheHit: row.cache_hit != null ? row.cache_hit === 1 : undefined,
     }));
 
     return { data, total, page: pagination.page, perPage: pagination.perPage };
@@ -285,6 +314,11 @@ export class RequestStore {
       accountEmail: row.account_email,
       matchedBy: row.matched_by,
       routeId: row.route_id,
+      ttfbMs: row.ttfb_ms ?? undefined,
+      accountSelectionMs: row.account_selection_ms ?? undefined,
+      streamCreationMs: row.stream_creation_ms ?? undefined,
+      accountsAttempted: row.accounts_attempted ?? undefined,
+      cacheHit: row.cache_hit != null ? row.cache_hit === 1 : undefined,
     };
   }
 
@@ -305,6 +339,7 @@ export class RequestStore {
         tokens: { input: 0, output: 0, cache: 0, total: 0 },
         avgDurationMs: 0,
         cacheHitRate: 0,
+        streaming: { avgTtfbMs: 0, cacheHitRate: 0, avgAccountsAttempted: 0 },
         byModel: {},
         byProtocol: {},
         byHour: [],
@@ -433,6 +468,11 @@ export class RequestStore {
       },
       avgDurationMs: stats.avgDurationMs || 0,
       cacheHitRate: totalTokens > 0 ? cacheTokens / totalTokens : 0,
+      streaming: {
+        avgTtfbMs: stats.avgTtfbMs || 0,
+        cacheHitRate: totalTokens > 0 ? cacheTokens / totalTokens : 0,
+        avgAccountsAttempted: stats.avgAccountsAttempted || 0,
+      },
       byModel,
       byProtocol,
       byHour,

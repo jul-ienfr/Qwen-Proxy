@@ -3,6 +3,7 @@
  */
 
 import type { Context } from 'hono';
+import { stream as honoStream } from 'hono/streaming';
 import crypto from 'crypto';
 import { adapterRegistry } from '../adapters/index.js';
 import type { NormalizedRequest, ProtocolAdapter, NormalizedResponse } from '../adapters/types.js';
@@ -12,22 +13,22 @@ import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, getAcc
 import { loadAccounts } from '../core/accounts.js';
 import { registerStream, removeStream } from '../core/stream-registry.js';
 import { metrics } from '../core/metrics.js';
-import { requestLogger } from '../core/request-logger.js';
+import { requestLogger, RequestTimer } from '../core/request-logger.js';
 import { getDebugLogger } from '../core/debug-logger.js';
-import { getSessionManager, buildMessageFingerprints, extractTextContent, getMessageFingerprint } from '../core/session-manager.js';
+import { StreamingToolParser } from '../tools/parser.js';
+import { resolveSession, buildSessionContext, updateSessionState, releaseSessionFlight } from './request-executor.js';
 
 // ─── Anthropic Endpoint ──────────────────────────────────────────────────────
 
 export async function anthropicMessages(c: Context) {
   const startTime = Date.now();
+  const timer = new RequestTimer();
   const adapter = adapterRegistry.get('anthropic')!;
   let activeSession: import('../core/session-manager.js').ChatSession | null = null;
 
-  const releaseSessionFlight = () => {
-    if (activeSession) {
-      getSessionManager().releaseFlight(activeSession.sessionId);
-      activeSession = null;
-    }
+  const releaseMyFlight = () => {
+    releaseSessionFlight(activeSession);
+    activeSession = null;
   };
 
   try {
@@ -71,32 +72,21 @@ export async function anthropicMessages(c: Context) {
     let uiSessionId = '';
 
     // ─── Session Detection (Anthropic) ──────────────────────────────────
-    const sessionMgr = getSessionManager();
-    const sessionHeader = c.req.header('x-qwenproxy-session-id');
-    let deltaStartIndex = 0;
+    const sessionResult = await resolveSession({
+      sessionHeader: c.req.header('x-qwenproxy-session-id'),
+      messages: normalized.messages || [],
+      model: normalized.model,
+      busyResponse: (sessionId) => ({
+        body: { type: 'error', error: { type: 'api_error', message: `Session ${sessionId} is busy` } },
+        status: 429,
+      }),
+    });
 
-    if (sessionHeader) {
-      try {
-        activeSession = await sessionMgr.getOrCreate({
-          sessionId: sessionHeader,
-          model: normalized.model,
-        });
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ type: 'error', error: { type: 'api_error', message: `Session ${sessionHeader} is busy` } }, 429 as any);
-        }
-        deltaStartIndex = activeSession.messageCount;
-      } catch (err: any) {
-        console.error(`[Anthropic] Failed to get/create session ${sessionHeader}:`, err.message);
-      }
-    } else if (normalized.messages?.length > 0) {
-      const match = sessionMgr.matchByMessages(normalized.messages, normalized.model);
-      if (match) {
-        activeSession = match.session;
-        deltaStartIndex = match.newMessageStartIndex;
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ type: 'error', error: { type: 'api_error', message: `Session ${activeSession.sessionId} is busy` } }, 429 as any);
-        }
-      }
+    activeSession = sessionResult.activeSession;
+    let deltaStartIndex = sessionResult.deltaStartIndex;
+
+    if (!sessionResult.resolved) {
+      return c.json(sessionResult.busyResponse.body, sessionResult.busyResponse.status as any);
     }
 
     // Build prompt from normalized messages (delta only if session active)
@@ -107,12 +97,8 @@ export async function anthropicMessages(c: Context) {
     const finalPrompt = buildPromptFromMessages(tempNormalized);
 
     // Build session context for createQwenStream
-    const sessionContext = activeSession ? {
-      chatId: activeSession.chatId,
-      parentId: activeSession.parentId,
-      headers: await sessionMgr.refreshHeadersIfNeeded(activeSession),
-      accountId: activeSession.accountId,
-    } : undefined;
+    const sessionContext = await buildSessionContext(activeSession);
+    timer.mark('sessionReady');
 
     // Try accounts
     const isGuestModeOnly = process.env.QWEN_GUEST_MODE_ONLY?.toLowerCase() === 'true';
@@ -193,22 +179,13 @@ export async function anthropicMessages(c: Context) {
     }
 
     if (!stream) {
-      releaseSessionFlight();
+      releaseMyFlight();
       throw lastError || new Error('All accounts failed');
     }
 
     // ─── Update session state after successful stream creation ──────────
     if (activeSession && normalized.messages?.length) {
-      const newMsgCount = normalized.messages.length;
-      const fps = buildMessageFingerprints(normalized.messages, deltaStartIndex, newMsgCount);
-      const existingFps = new Map<number, string>();
-      for (let i = 0; i < deltaStartIndex; i++) {
-        const msg = normalized.messages[i];
-        const text = extractTextContent(msg.content);
-        existingFps.set(i, getMessageFingerprint(msg.role, text));
-      }
-      for (const [k, v] of fps) existingFps.set(k, v);
-      sessionMgr.updateMessageState(activeSession.sessionId, newMsgCount, existingFps);
+      updateSessionState(activeSession, normalized.messages, deltaStartIndex);
     }
 
     // Add session header to response
@@ -216,18 +193,21 @@ export async function anthropicMessages(c: Context) {
       c.header('X-QwenProxy-Session-Id', activeSession.sessionId);
     }
 
+    timer.mark('streamReady');
+    const streamCreationMs = timer.elapsed('sessionReady');
+
     // Handle streaming vs non-streaming
     if (normalized.stream) {
-      const response = await handleAnthropicStream(c, stream, adapter, normalized.model, completionId, startTime, normalized);
-      releaseSessionFlight();
+      const response = await handleAnthropicStream(c, stream, adapter, normalized.model, completionId, startTime, normalized, timer, streamCreationMs);
+      releaseMyFlight();
       return response;
     } else {
-      const response = await handleAnthropicNonStream(c, stream, adapter, normalized.model, completionId, startTime, normalized);
-      releaseSessionFlight();
+      const response = await handleAnthropicNonStream(c, stream, adapter, normalized.model, completionId, startTime, normalized, timer, streamCreationMs);
+      releaseMyFlight();
       return response;
     }
   } catch (err: any) {
-    releaseSessionFlight();
+    releaseMyFlight();
     const endTime = Date.now();
     requestLogger.log({
       originalModel: 'anthropic',
@@ -245,6 +225,7 @@ export async function anthropicMessages(c: Context) {
       totalTokens: 0,
       startTime,
       endTime,
+      streamCreationMs: timer.elapsed('sessionReady'),
       success: false,
       statusCode: err.upstreamStatus || 500,
       errorMessage: err.message,
@@ -267,125 +248,111 @@ async function handleAnthropicStream(
   model: string,
   completionId: string,
   startTime: number,
-  normalized: NormalizedRequest
+  normalized: NormalizedRequest,
+  timer: RequestTimer,
+  streamCreationMs: number
 ) {
-  c.header('Content-Type', 'text/event-stream');
-  c.header('Cache-Control', 'no-cache');
-  c.header('Connection', 'keep-alive');
-  c.header('x-request-id', completionId);
+  const hasTools = normalized.tools && normalized.tools.length > 0;
+  const toolParser = hasTools ? new StreamingToolParser(normalized.tools as any) : null;
+  let blockIndex = 1;
 
   const encoder = new TextEncoder();
-  const reader = stream.getReader();
+  return honoStream(c, async (streamWriter) => {
+    c.header('Content-Type', 'text/event-stream');
+    c.header('Cache-Control', 'no-cache');
+    c.header('Connection', 'keep-alive');
 
-  const response = new ReadableStream({
-    async start(controller) {
-      // Send message_start
-      const startEvent = adapter.formatStreamStart(model);
-      controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify(startEvent)}\n\n`));
+    // Send heartbeat to prevent timeout
+    await streamWriter.write(': heartbeat\n\n');
+    const heartbeat = setInterval(async () => {
+      try { await streamWriter.write(': keep-alive\n\n'); } catch { /* heartbeat write failed, will be cleared by outer cleanup */ }
+    }, 15000);
 
-      try {
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
+    const startEvent = adapter.formatStreamStart(model);
+    await streamWriter.write(`event: message_start\ndata: ${JSON.stringify(startEvent)}\n\n`);
 
-          buffer += new TextDecoder().decode(value);
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              if (data === '[DONE]') break;
-
-              try {
-                const chunk = JSON.parse(data);
-
-                // Map Qwen's thinking_summary format to the format expected by adapters
-                // Qwen sends: { phase: 'thinking_summary', extra: { summary_thought: { content: [...] } } }
-                // Adapters expect: { delta: { thinking: '...' } } or { delta: { reasoning_content: '...' } }
-                if (chunk.choices?.[0]?.delta?.phase === 'thinking_summary') {
-                  const delta = chunk.choices[0].delta;
-                  if (delta.extra?.summary_thought?.content) {
-                    const thoughts = delta.extra.summary_thought.content;
-                    if (thoughts.length > 0) {
-                      // Create a new chunk with thinking mapped to the standard format
-                      const thinkingChunk = {
-                        ...chunk,
-                        choices: [{
-                          ...chunk.choices[0],
-                          delta: {
-                            ...delta,
-                            thinking: thoughts.join('\n'),
-                            // Also set reasoning_content for OpenAI-compatible clients
-                            reasoning_content: thoughts.join('\n'),
-                          }
-                        }]
-                      };
-                      const formatted = adapter.formatStreamChunk(thinkingChunk);
-                      if (formatted && Array.isArray(formatted)) {
-                        for (const event of formatted) {
-                          const eventType = event.type || 'content_block_delta';
-                          controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`));
-                        }
-                      }
-                    }
-                  }
-                } else {
-                  // Pass through to adapter as-is for non-thinking chunks
-                  const formatted = adapter.formatStreamChunk(chunk);
-                  if (formatted && Array.isArray(formatted)) {
-                    for (const event of formatted) {
-                      const eventType = event.type || 'content_block_delta';
-                      controller.enqueue(encoder.encode(`event: ${eventType}\ndata: ${JSON.stringify(event)}\n\n`));
-                    }
-                  }
-                }
-              } catch {}
+    const reader = stream.getReader();
+    try {
+      let buffer = '';
+      const decoder = new TextDecoder();
+      let chunkCount = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) { console.log(`[Anthropic-DEBUG] Stream ended after ${chunkCount} chunks`); break; }
+        chunkCount++;
+        if (chunkCount <= 3) console.log(`[Anthropic-DEBUG] Chunk #${chunkCount} (${value.length} bytes): ${decoder.decode(value).substring(0, 200)}`);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+          try {
+            const chunk = JSON.parse(data);
+            const choice = chunk.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta;
+            if (delta?.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
+              const thoughts = delta.extra.summary_thought.content;
+              if (thoughts.length > 0) {
+                const tc = { ...chunk, choices: [{ ...choice, delta: { ...delta, thinking: thoughts.join('\n'), reasoning_content: thoughts.join('\n') } }] };
+                const fmt = adapter.formatStreamChunk(tc);
+                if (fmt && Array.isArray(fmt)) for (const e of fmt) await streamWriter.write(`event: ${e.type || 'content_block_delta'}\ndata: ${JSON.stringify(e)}\n\n`);
+              }
+            } else if (toolParser && delta?.content) {
+              const r = toolParser.feed(delta.content);
+              if (r.text) await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: r.text } })}\n\n`);
+              for (const tc of r.toolCalls) {
+                const idx = blockIndex++;
+                await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: tc.name } })}\n\n`);
+                await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) } })}\n\n`);
+                await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`);
+              }
+            } else {
+              // Convert Qwen phase format to OpenAI format for the adapter
+              let convertedChunk = chunk;
+              if (delta?.phase === 'answer' && delta.content !== undefined) {
+                convertedChunk = {
+                  ...chunk,
+                  choices: [{ ...choice, delta: { content: delta.content } }],
+                };
+              } else if (delta?.content !== undefined && !delta.phase) {
+                // Already OpenAI format — pass through
+              }
+              const fmt = adapter.formatStreamChunk(convertedChunk);
+              if (fmt && Array.isArray(fmt)) for (const e of fmt) await streamWriter.write(`event: ${e.type || 'content_block_delta'}\ndata: ${JSON.stringify(e)}\n\n`);
             }
-          }
+          } catch {}
         }
-      } catch (err) {
-        console.error('[Anthropic] Stream error:', err);
       }
+      if (toolParser) {
+        const f = toolParser.flush();
+        for (const tc of f.toolCalls) {
+          const idx = blockIndex++;
+          await streamWriter.write(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: tc.id, name: tc.name } })}\n\n`);
+          await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.arguments) } })}\n\n`);
+          await streamWriter.write(`event: content_block_stop\ndata: ${JSON.stringify({ type: 'content_block_stop', index: idx })}\n\n`);
+        }
+        if (f.text) await streamWriter.write(`event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: f.text } })}\n\n`);
+      }
+    } catch (err) { console.error('[Anthropic] Stream error:', err); }
+    clearInterval(heartbeat);
 
-      // Send message_stop
-      const endEvent = adapter.formatStreamEnd();
-      controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify(endEvent)}\n\n`));
+    // Determine stop_reason based on whether tool calls were emitted
+    const hasToolCalls = blockIndex > 1;
+    const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
 
-      // Log request
-      const endTime = Date.now();
-      requestLogger.log({
-        originalModel: normalized.originalModel,
-        mappedModel: model,
-        protocol: 'anthropic',
-        endpoint: '/v1/messages',
-        clientIp: 'unknown',
-        userAgent: 'unknown',
-        thinking: normalized.thinking || false,
-        hasTools: (normalized.tools?.length ?? 0) > 0,
-        streamMode: true,
-        inputTokens: 0,
-        outputTokens: 0,
-        cacheTokens: 0,
-        totalTokens: 0,
-        startTime,
-        endTime,
-          success: true,
-        accountId: 'unknown',
-        matchedBy: 'mapping',
-      });
+    // Emit message_delta with stop_reason (required by Claude Code)
+    await streamWriter.write(`event: message_delta\ndata: ${JSON.stringify({
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: 0 },
+    })}\n\n`);
 
-      controller.close();
-    },
-  });
-
-  return new Response(response, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    },
+    // Emit message_stop
+    await streamWriter.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+    requestLogger.log({ originalModel: normalized.originalModel, mappedModel: model, protocol: 'anthropic', endpoint: '/v1/messages', clientIp: c.req.header('x-forwarded-for') || 'unknown', userAgent: c.req.header('user-agent') || 'unknown', thinking: normalized.thinking || false, hasTools: (normalized.tools?.length ?? 0) > 0, streamMode: true, inputTokens: 0, outputTokens: 0, cacheTokens: 0, totalTokens: 0, startTime, endTime: Date.now(), streamCreationMs, success: true, statusCode: 200, accountId: 'unknown' });
   });
 }
 
@@ -398,7 +365,9 @@ async function handleAnthropicNonStream(
   model: string,
   completionId: string,
   startTime: number,
-  normalized: NormalizedRequest
+  normalized: NormalizedRequest,
+  timer: RequestTimer,
+  streamCreationMs: number
 ) {
   // Collect full response from stream
   const reader = stream.getReader();
@@ -453,6 +422,18 @@ async function handleAnthropicNonStream(
     console.error('[Anthropic] Stream read error:', err?.message);
   }
 
+  // Parse tool calls from content if tools are present
+  let toolCalls: any[] = [];
+  let textContent = fullContent;
+  if (normalized.tools && normalized.tools.length > 0 && fullContent.includes('<tool_call>')) {
+    const tp = new StreamingToolParser(normalized.tools as any);
+    const r = tp.feed(fullContent);
+    const f = tp.flush();
+    toolCalls = [...r.toolCalls, ...f.toolCalls];
+    textContent = r.text + f.text;
+    console.log(`[Anthropic] Non-stream: parsed ${toolCalls.length} tool calls from ${fullContent.length} chars`);
+  }
+
   // Build normalized response
   const normalizedResponse: NormalizedResponse = {
     id: completionId,
@@ -463,11 +444,17 @@ async function handleAnthropicNonStream(
       index: 0,
       message: {
         role: 'assistant',
-        content: fullContent,
-        // Include thinking content if present
+        content: textContent,
         ...(thinkingContent ? { thinking: thinkingContent } : {}),
+        ...(toolCalls.length > 0 ? {
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id,
+            type: 'function',
+            function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+          })),
+        } : {}),
       },
-      finish_reason: 'stop',
+      finish_reason: toolCalls.length > 0 ? 'tool_use' : 'stop',
     }],
     usage: {
       prompt_tokens: 0,
@@ -497,6 +484,7 @@ async function handleAnthropicNonStream(
     totalTokens: 0,
     startTime,
     endTime,
+    streamCreationMs,
     success: true,
     accountId: 'unknown',
     matchedBy: 'mapping',
@@ -551,14 +539,13 @@ function buildPromptFromMessages(normalized: NormalizedRequest): string {
 
 export async function geminiGenerateContent(c: Context) {
   const startTime = Date.now();
+  const timer = new RequestTimer();
   const adapter = adapterRegistry.get('gemini')!;
   let activeSession: import('../core/session-manager.js').ChatSession | null = null;
 
-  const releaseSessionFlight = () => {
-    if (activeSession) {
-      getSessionManager().releaseFlight(activeSession.sessionId);
-      activeSession = null;
-    }
+  const releaseMyFlight = () => {
+    releaseSessionFlight(activeSession);
+    activeSession = null;
   };
 
   try {
@@ -601,32 +588,21 @@ export async function geminiGenerateContent(c: Context) {
     let stream: ReadableStream | undefined;
 
     // ─── Session Detection (Gemini) ────────────────────────────────────
-    const sessionMgr = getSessionManager();
-    const sessionHeader = c.req.header('x-qwenproxy-session-id');
-    let deltaStartIndex = 0;
+    const sessionResult = await resolveSession({
+      sessionHeader: c.req.header('x-qwenproxy-session-id'),
+      messages: normalized.messages || [],
+      model: normalized.model,
+      busyResponse: (sessionId) => ({
+        body: { error: { code: 429, message: `Session ${sessionId} is busy`, status: 'RESOURCE_EXHAUSTED' } },
+        status: 429,
+      }),
+    });
 
-    if (sessionHeader) {
-      try {
-        activeSession = await sessionMgr.getOrCreate({
-          sessionId: sessionHeader,
-          model: normalized.model,
-        });
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ error: { code: 429, message: `Session ${sessionHeader} is busy`, status: 'RESOURCE_EXHAUSTED' } }, 429);
-        }
-        deltaStartIndex = activeSession.messageCount;
-      } catch (err: any) {
-        console.error(`[Gemini] Failed to get/create session ${sessionHeader}:`, err.message);
-      }
-    } else if (normalized.messages?.length > 0) {
-      const match = sessionMgr.matchByMessages(normalized.messages, normalized.model);
-      if (match) {
-        activeSession = match.session;
-        deltaStartIndex = match.newMessageStartIndex;
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ error: { code: 429, message: `Session ${activeSession.sessionId} is busy`, status: 'RESOURCE_EXHAUSTED' } }, 429);
-        }
-      }
+    activeSession = sessionResult.activeSession;
+    let deltaStartIndex = sessionResult.deltaStartIndex;
+
+    if (!sessionResult.resolved) {
+      return c.json(sessionResult.busyResponse.body, sessionResult.busyResponse.status as any);
     }
 
     // Build prompt from delta messages only if session active
@@ -637,12 +613,8 @@ export async function geminiGenerateContent(c: Context) {
     const finalPrompt = buildPromptFromMessages(tempNormalized);
 
     // Build session context for createQwenStream
-    const sessionContext = activeSession ? {
-      chatId: activeSession.chatId,
-      parentId: activeSession.parentId,
-      headers: await sessionMgr.refreshHeadersIfNeeded(activeSession),
-      accountId: activeSession.accountId,
-    } : undefined;
+    const sessionContext = await buildSessionContext(activeSession);
+    timer.mark('sessionReady');
 
     // Try guest mode
     const isGuestModeOnly = process.env.QWEN_GUEST_MODE_ONLY?.toLowerCase() === 'true';
@@ -707,22 +679,13 @@ export async function geminiGenerateContent(c: Context) {
     }
 
     if (!stream) {
-      releaseSessionFlight();
+      releaseMyFlight();
       throw lastError || new Error('All accounts failed');
     }
 
     // ─── Update session state after successful stream creation ──────────
     if (activeSession && normalized.messages?.length) {
-      const newMsgCount = normalized.messages.length;
-      const fps = buildMessageFingerprints(normalized.messages, deltaStartIndex, newMsgCount);
-      const existingFps = new Map<number, string>();
-      for (let i = 0; i < deltaStartIndex; i++) {
-        const msg = normalized.messages[i];
-        const text = extractTextContent(msg.content);
-        existingFps.set(i, getMessageFingerprint(msg.role, text));
-      }
-      for (const [k, v] of fps) existingFps.set(k, v);
-      sessionMgr.updateMessageState(activeSession.sessionId, newMsgCount, existingFps);
+      updateSessionState(activeSession, normalized.messages, deltaStartIndex);
     }
 
     // Add session header to response
@@ -730,18 +693,21 @@ export async function geminiGenerateContent(c: Context) {
       c.header('X-QwenProxy-Session-Id', activeSession.sessionId);
     }
 
+    timer.mark('streamReady');
+    const streamCreationMs = timer.elapsed('sessionReady');
+
     // Handle streaming vs non-streaming
     if (normalized.stream) {
-      const response = await handleGeminiStream(c, stream, adapter, normalized.model, startTime, normalized);
-      releaseSessionFlight();
+      const response = await handleGeminiStream(c, stream, adapter, normalized.model, startTime, normalized, timer, streamCreationMs);
+      releaseMyFlight();
       return response;
     } else {
-      const response = await handleGeminiNonStream(c, stream, adapter, normalized.model, startTime, normalized);
-      releaseSessionFlight();
+      const response = await handleGeminiNonStream(c, stream, adapter, normalized.model, startTime, normalized, timer, streamCreationMs);
+      releaseMyFlight();
       return response;
     }
   } catch (err: any) {
-    releaseSessionFlight();
+    releaseMyFlight();
     const endTime = Date.now();
     requestLogger.log({
       originalModel: 'gemini',
@@ -759,6 +725,7 @@ export async function geminiGenerateContent(c: Context) {
       totalTokens: 0,
       startTime,
       endTime,
+      streamCreationMs: timer.elapsed('sessionReady'),
       success: false,
       statusCode: err.upstreamStatus || 500,
       errorMessage: err.message,
@@ -779,7 +746,9 @@ async function handleGeminiStream(
   adapter: ProtocolAdapter,
   model: string,
   startTime: number,
-  normalized: NormalizedRequest
+  normalized: NormalizedRequest,
+  timer: RequestTimer,
+  streamCreationMs: number
 ) {
   c.header('Content-Type', 'application/json');
 
@@ -830,6 +799,7 @@ async function handleGeminiStream(
     totalTokens: 0,
     startTime,
     endTime,
+    streamCreationMs,
     success: true,
     accountId: 'unknown',
     matchedBy: 'mapping',
@@ -846,7 +816,9 @@ async function handleGeminiNonStream(
   adapter: ProtocolAdapter,
   model: string,
   startTime: number,
-  normalized: NormalizedRequest
+  normalized: NormalizedRequest,
+  timer: RequestTimer,
+  streamCreationMs: number
 ) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -911,6 +883,7 @@ async function handleGeminiNonStream(
     totalTokens: 0,
     startTime,
     endTime,
+    streamCreationMs,
     success: true,
     accountId: 'unknown',
     matchedBy: 'mapping',

@@ -9,7 +9,7 @@ import { loadAccounts } from '../core/accounts.js';
 import { registerStream, removeStream, getStream } from '../core/stream-registry.js';
 import { metrics } from '../core/metrics.js'
 import { modelMapper } from '../core/model-mapper.js'
-import { requestLogger } from '../core/request-logger.js'
+import { requestLogger, RequestTimer } from '../core/request-logger.js'
 import { getDebugLogger } from '../core/debug-logger.js'
 import {
   getForcedToolName,
@@ -19,32 +19,12 @@ import {
   buildToolCallContract,
 } from './tool-handler.js';
 import { handleStreamingResponse, handleNonStreamingResponse } from './stream-handler.js';
-import { getSessionManager, buildMessageFingerprints, extractTextContent, getMessageFingerprint } from '../core/session-manager.js';
-
-// Response cache for non-streaming requests
-const responseCache = new Map<string, { data: any; expiresAt: number }>();
-const RESPONSE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-const RESPONSE_CACHE_MAX = 200;
+import { resolveSession, buildSessionContext, updateSessionState as updateSessionStateShared, releaseSessionFlight as releaseSessionFlightShared } from './request-executor.js';
+import { getPredictionCacheKey, cacheStreamingResponse, getCachedStreamingChunks, createReplayStream } from '../cache/prediction-cache.js';
+import { cache } from '../cache/memory-cache.js';
 
 function getCacheKey(prompt: string, model: string, thinking: boolean, thinkingEffort: string): string {
-  return crypto.createHash('sha256').update(`${model}:${thinking}:${thinkingEffort}:${prompt}`).digest('hex').slice(0, 32);
-}
-
-function getCachedResponse(key: string): any | null {
-  const entry = responseCache.get(key);
-  if (!entry || entry.expiresAt <= Date.now()) {
-    if (entry) responseCache.delete(key);
-    return null;
-  }
-  return entry.data;
-}
-
-function setCachedResponse(key: string, data: any): void {
-  if (responseCache.size >= RESPONSE_CACHE_MAX) {
-    const oldest = responseCache.keys().next().value;
-    if (oldest) responseCache.delete(oldest);
-  }
-  responseCache.set(key, { data, expiresAt: Date.now() + RESPONSE_CACHE_TTL });
+  return `${model}:${thinking}:${thinkingEffort}:${prompt}`.slice(0, 64);
 }
 
 export { getIncrementalDelta } from './sse-parser.js';
@@ -52,16 +32,15 @@ export type { DeltaResult } from './sse-parser.js';
 
 export async function chatCompletions(c: Context) {
   const startTime = Date.now();
+  const timer = new RequestTimer();
   let body: OpenAIRequest;
   let bodyAny: any;
   const dbg = getDebugLogger();
   let activeSession: import('../core/session-manager.js').ChatSession | null = null;
 
-  const releaseSessionFlight = () => {
-    if (activeSession) {
-      getSessionManager().releaseFlight(activeSession.sessionId);
-      activeSession = null;
-    }
+  const releaseMySession = () => {
+    releaseSessionFlightShared(activeSession);
+    activeSession = null;
   };
 
   try {
@@ -81,10 +60,6 @@ export async function chatCompletions(c: Context) {
     }
 
     // ─── Session Detection ───────────────────────────────────────────────
-    const sessionMgr = getSessionManager();
-    const sessionHeader = c.req.header('x-qwenproxy-session-id');
-    let deltaStartIndex = 0; // Index where new messages start
-
     const messages = body.messages || [];
     const modelId = body.model.replace('-no-thinking', '');
     modelMapper.checkForReload();
@@ -95,36 +70,23 @@ export async function chatCompletions(c: Context) {
     });
     const resolvedModel = mappingResult.targetModel;
 
-    if (sessionHeader) {
-      // Explicit session ID from header
-      try {
-        activeSession = await sessionMgr.getOrCreate({
-          sessionId: sessionHeader,
-          model: resolvedModel,
-        });
+    const sessionResult = await resolveSession({
+      sessionHeader: c.req.header('x-qwenproxy-session-id'),
+      messages,
+      model: resolvedModel,
+      busyResponse: (sessionId) => ({
+        body: { error: { message: `Session ${sessionId} is busy (another request in progress)` } },
+        status: 429,
+      }),
+    });
 
-        // Anti-concurrence: reject if session is busy
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ error: { message: `Session ${sessionHeader} is busy (another request in progress)` } }, 429);
-        }
+    activeSession = sessionResult.activeSession;
+    let deltaStartIndex = sessionResult.deltaStartIndex;
 
-        deltaStartIndex = activeSession.messageCount;
-      } catch (err: any) {
-        console.error(`[Chat] Failed to get/create session ${sessionHeader}:`, err.message);
-        // Fall through to non-session behavior
-      }
-    } else if (messages.length > 0) {
-      // Auto-detect: try to match messages to existing session
-      const match = sessionMgr.matchByMessages(messages, resolvedModel);
-      if (match) {
-        activeSession = match.session;
-        deltaStartIndex = match.newMessageStartIndex;
-
-        if (!sessionMgr.acquireFlight(activeSession.sessionId)) {
-          return c.json({ error: { message: `Session ${activeSession.sessionId} is busy` } }, 429);
-        }
-      }
+    if (!sessionResult.resolved) {
+      return c.json(sessionResult.busyResponse.body, sessionResult.busyResponse.status as any);
     }
+    timer.mark('sessionReady');
 
     let prompt = '';
     let systemPrompt = '';
@@ -207,6 +169,9 @@ export async function chatCompletions(c: Context) {
     }
 
     if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
+      const forcedToolName = getForcedToolName(bodyAny.tool_choice);
+      const parallelToolCalls = bodyAny.parallel_tool_calls !== false;
+
       const formattedTools = bodyAny.tools.map((t: any) => {
         if (t.type === 'function') {
           return {
@@ -217,9 +182,12 @@ export async function chatCompletions(c: Context) {
         }
         return t;
       });
-      const toolsJson = JSON.stringify(formattedTools, null, 2);
-      
-      systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in <tool_call> tags:\n\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n6. NEVER invent, guess, or hallucinate tool names. You MUST ONLY use the exact tool names provided in the 'TOOLS AVAILABLE' list above. Calling an unlisted tool will result in a hard execution error.\n\n`;
+
+      // Use compact tool manifest + contract (existing infrastructure)
+      const toolManifest = buildCompactToolManifest(formattedTools, forcedToolName);
+      const toolContract = buildToolCallContract(formattedTools, forcedToolName, parallelToolCalls);
+
+      systemPrompt += `\n\n${toolManifest}\n\n${toolContract}\n\n`;
       
       if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
         const forcedTool = bodyAny.tool_choice.function.name;
@@ -275,18 +243,13 @@ export async function chatCompletions(c: Context) {
     const completionId = 'chatcmpl-' + crypto.randomUUID();
 
     // Build session context for createQwenStream (null if no active session)
-    const sessionContext = activeSession ? {
-      chatId: activeSession.chatId,
-      parentId: activeSession.parentId,
-      headers: await sessionMgr.refreshHeadersIfNeeded(activeSession),
-      accountId: activeSession.accountId,
-    } : undefined;
+    const sessionContext = await buildSessionContext(activeSession);
     let lastError: any = null;
 
     // Check response cache for non-streaming requests
     if (!isStream) {
       const cacheKey = getCacheKey(finalPrompt, resolvedModel, isThinkingModel, thinkingMode);
-      const cached = getCachedResponse(cacheKey);
+      const cached = await cache.get(cacheKey as any);
       if (cached) {
         metrics.increment('cache.hit');
         if (dbg.isEnabled()) {
@@ -299,6 +262,35 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    // ─── Prediction Cache for Streaming Requests ────────────────────────────
+    // Use FNV-1a hash to check if we have a cached streaming response
+    let predictionCacheKey = '';
+    let predictionCacheHit = false;
+    if (isStream && !hasTools) {
+      predictionCacheKey = getPredictionCacheKey(finalPrompt, resolvedModel, isThinkingModel);
+      const cachedChunks = getCachedStreamingChunks(predictionCacheKey);
+      if (cachedChunks) {
+        metrics.increment('prediction_cache.hit');
+        if (dbg.isEnabled()) {
+          dbg.log('CACHE', 'chat.ts', 'Prediction cache HIT — replaying cached stream', {
+            predictionCacheKey,
+            chunkCount: cachedChunks.length,
+          });
+        }
+        // Set stream to replay stream; the rest of the code flows normally
+        stream = createReplayStream(cachedChunks);
+        predictionCacheHit = true;
+      } else {
+        metrics.increment('prediction_cache.miss');
+        if (dbg.isEnabled()) {
+          dbg.log('CACHE', 'chat.ts', 'Prediction cache MISS for streaming request', { predictionCacheKey });
+        }
+      }
+    }
+
+    // Skip upstream request if prediction cache already provided a replay stream
+    if (!stream) {
+    timer.mark('streamStart');
     if (isGuestModeOnly) {
       console.log('[Chat] Guest mode only enabled. Bypassing account rotation.');
       try {
@@ -327,35 +319,34 @@ export async function chatCompletions(c: Context) {
         throw err;
       }
     } else {
-      let account = getNextAccount();
-      const triedAccountIds = new Set<string>();
+      // ─── Parallel Account Racing ──────────────────────────────────────
+      // Collect up to 3 available accounts (not on cooldown)
+      const candidateAccounts: Array<{ id: string; email: string }> = [];
+      const checkedIds = new Set<string>();
+      let nextAccount = getNextAccount();
 
-      while (account) {
-        const accountId = account.id;
-        const accountEmail = account.email;
-
-        if (triedAccountIds.has(accountId)) {
-          account = getNextAvailableAccount(triedAccountIds);
-          continue;
+      while (nextAccount && candidateAccounts.length < 3) {
+        if (!checkedIds.has(nextAccount.id)) {
+          checkedIds.add(nextAccount.id);
+          const cooldownInfo = getAccountCooldownInfo(nextAccount.id);
+          if (!cooldownInfo || nextAccount.id === 'global') {
+            candidateAccounts.push({ id: nextAccount.id, email: nextAccount.email });
+          } else {
+            console.log(`[Chat] Skipping account ${nextAccount.email} (${nextAccount.id}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
+          }
         }
-        triedAccountIds.add(accountId);
+        nextAccount = getNextAvailableAccount(checkedIds);
+      }
 
-        const cooldownInfo = getAccountCooldownInfo(accountId);
-        if (cooldownInfo && accountId !== 'global') {
-          console.log(`[Chat] Skipping account ${accountEmail} (${accountId}) — on cooldown for ${Math.round(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`);
-          account = getNextAvailableAccount(triedAccountIds);
-          continue;
-        }
+      // Try one account with sequential retries (3 attempts with exponential backoff)
+      async function tryAccountWithRetries(accountId: string, accountEmail: string) {
+        let retries = 3;
+        let retryDelay = 500;
 
         console.log(`[Chat] Routing request to account: ${accountEmail} (${accountId})`);
-
         if (dbg.isEnabled()) {
           dbg.log('ACCOUNT', 'chat.ts', `Routing to account: ${accountEmail}`, { accountId });
         }
-
-        let retries = 3;
-        let retryDelay = 500;
-        let success = false;
 
         while (retries > 0) {
           try {
@@ -370,28 +361,7 @@ export async function chatCompletions(c: Context) {
               thinkingMode,
               sessionContext,
             );
-            stream = result.stream;
-            uiSessionId = result.uiSessionId;
-            const streamCreationMs = Date.now() - startTime;
-            console.log(`[Chat] Stream created in ${streamCreationMs}ms for account ${accountEmail}`);
-
-            if (dbg.isEnabled()) {
-              dbg.log('STREAM', 'chat.ts', `Stream created in ${streamCreationMs}ms`, {
-                accountId,
-                accountEmail,
-                streamCreationMs,
-                uiSessionId: result.uiSessionId,
-              });
-            }
-            registerStream(completionId, {
-              abortController: result.controller,
-              accountId: result.accountId,
-              uiSessionId: result.uiSessionId,
-              targetResponseId: '',
-              headers: result.headers,
-            });
-            success = true;
-            break;
+            return result;
           } catch (err: any) {
             retries--;
 
@@ -401,8 +371,7 @@ export async function chatCompletions(c: Context) {
               const cooldownMs = hours * 60 * 60 * 1000;
               markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
               console.warn(`[Chat] Account ${accountEmail} (${accountId}) rate-limited. Entering cooldown for ${hours} hours.`);
-              lastError = err;
-              break;
+              throw err;
             }
 
             if (retries === 0) {
@@ -410,8 +379,7 @@ export async function chatCompletions(c: Context) {
                 markAccountRateLimited(accountId, undefined, 'ServerError');
                 console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
               }
-              lastError = err;
-              break;
+              throw err;
             }
 
             let useDelay = retryDelay;
@@ -420,20 +388,51 @@ export async function chatCompletions(c: Context) {
             }
             const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
             if (!isRetryable) {
-              lastError = err;
-              break;
+              throw err;
             }
             console.warn(`[Chat] Qwen request failed for ${accountEmail}, retrying in ${useDelay}ms... (${retries} left)`);
             await new Promise(r => setTimeout(r, useDelay));
             retryDelay = Math.min(retryDelay * 2, 5000);
           }
         }
+        throw new Error(`All retries exhausted for account ${accountEmail} (${accountId})`);
+      }
 
-        if (success) {
-          break;
+      // Race all candidate accounts in parallel
+      if (candidateAccounts.length > 0) {
+        const accountPromises = candidateAccounts.map(acc => tryAccountWithRetries(acc.id, acc.email));
+        try {
+          const result = await Promise.any(accountPromises);
+          stream = result.stream;
+          uiSessionId = result.uiSessionId;
+          const streamCreationMs = Date.now() - startTime;
+          console.log(`[Chat] Stream created in ${streamCreationMs}ms via parallel account racing (${candidateAccounts.length} accounts)`);
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'chat.ts', `Stream created in ${streamCreationMs}ms via parallel racing`, {
+              accountsAttempted: candidateAccounts.map(a => a.email),
+              streamCreationMs,
+              uiSessionId: result.uiSessionId,
+            });
+          }
+          registerStream(completionId, {
+            abortController: result.controller,
+            accountId: result.accountId,
+            uiSessionId: result.uiSessionId,
+            targetResponseId: '',
+            headers: result.headers,
+          });
+        } catch (aggregateErr: any) {
+          // All accounts failed — record errors for fallback logic
+          if (aggregateErr instanceof AggregateError) {
+            for (const err of aggregateErr.errors) {
+              console.error(`[Chat] Parallel account attempt failed:`, err.message);
+              lastError = err;
+            }
+          } else {
+            console.error(`[Chat] All parallel account attempts failed:`, aggregateErr.message);
+            lastError = aggregateErr;
+          }
         }
-
-        account = getNextAvailableAccount(triedAccountIds);
       }
     }
 
@@ -505,34 +504,27 @@ export async function chatCompletions(c: Context) {
       } else {
         throw lastError || new Error('All accounts failed');
       }
+    } // end if (!stream) — skip upstream when prediction cache hit
     }
+    timer.mark('streamReady');
 
     // ─── Prepare session state update (deferred until stream completes) ──
-    const updateSessionState = () => {
+    const doUpdateSessionState = () => {
       if (activeSession && stream) {
-        const newMsgCount = messages.length;
-        const fps = buildMessageFingerprints(messages, deltaStartIndex, newMsgCount);
-        const existingFps = new Map<number, string>();
-        for (let i = 0; i < deltaStartIndex; i++) {
-          const msg = messages[i];
-          const text = extractTextContent(msg.content);
-          existingFps.set(i, getMessageFingerprint(msg.role, text));
-        }
-        for (const [k, v] of fps) existingFps.set(k, v);
-        sessionMgr.updateMessageState(activeSession.sessionId, newMsgCount, existingFps);
+        updateSessionStateShared(activeSession, messages, deltaStartIndex);
       }
     };
 
     if (!isStream) {
       const response = await handleNonStreamingResponse(c, stream!, completionId, resolvedModel, uiSessionId, hasTools, bodyAny.tools || []);
       // Update session state after stream fully consumed (non-streaming)
-      updateSessionState();
+      doUpdateSessionState();
       // Cache non-streaming responses
       try {
         const cacheKey = getCacheKey(finalPrompt, resolvedModel, isThinkingModel, thinkingMode);
         const bodyClone = response.clone();
         const json = await bodyClone.json();
-        setCachedResponse(cacheKey, json);
+        await cache.set(cacheKey as any, json, 300);
       } catch { /* ignore cache errors */ }
       // Log successful request
       const endTime = Date.now();
@@ -558,11 +550,15 @@ export async function chatCompletions(c: Context) {
         accountId: 'unknown',
         matchedBy: mappingResult.matchedBy,
         routeId: mappingResult.routeId,
+        accountSelectionMs: timer.elapsed('sessionReady'),
+        streamCreationMs: timer.elapsed('streamReady') - timer.elapsed('streamStart'),
+        ttfbMs: undefined,
+        cacheHit: false,
       });
       // Add session ID to response header
       if (activeSession) {
         c.header('X-QwenProxy-Session-Id', activeSession.sessionId);
-        releaseSessionFlight();
+        releaseMySession();
       }
       return response;
     }
@@ -590,10 +586,56 @@ export async function chatCompletions(c: Context) {
       accountId: 'unknown',
       matchedBy: mappingResult.matchedBy,
       routeId: mappingResult.routeId,
+      accountSelectionMs: timer.elapsed('sessionReady'),
+      streamCreationMs: timer.elapsed('streamReady') - timer.elapsed('streamStart'),
+      ttfbMs: undefined,
+      cacheHit: predictionCacheHit,
     });
+    let streamForHandler = stream!;
+    if (predictionCacheKey && stream && !getCachedStreamingChunks(predictionCacheKey)) {
+      // This is a cache miss — wrap the upstream stream to capture SSE chunks
+      const originalReader = stream.getReader();
+      const decoder = new TextDecoder();
+      const capturedChunks: string[] = [];
+      let captureCompleted = false;
+
+      streamForHandler = new ReadableStream({
+        async pull(controller) {
+          try {
+            const { done, value } = await originalReader.read();
+            if (done) {
+              // Stream finished — cache the captured chunks (only complete responses)
+              if (capturedChunks.length > 0 && predictionCacheKey) {
+                cacheStreamingResponse(predictionCacheKey, capturedChunks);
+                metrics.increment('prediction_cache.stored');
+                if (dbg.isEnabled()) {
+                  dbg.log('CACHE', 'chat.ts', 'Stored streaming response in prediction cache', {
+                    predictionCacheKey,
+                    chunkCount: capturedChunks.length,
+                  });
+                }
+              }
+              captureCompleted = true;
+              controller.close();
+              return;
+            }
+            // Capture the raw bytes as string for caching
+            capturedChunks.push(decoder.decode(value, { stream: true }));
+            // Forward to consumer
+            controller.enqueue(value);
+          } catch (err) {
+            // On error, don't cache partial responses
+            try { controller.close(); } catch {}
+          }
+        },
+        cancel() {
+          originalReader.cancel();
+        }
+      });
+    }
 
     return handleStreamingResponse(c, {
-      stream: stream!,
+      stream: streamForHandler,
       completionId,
       model: resolvedModel,
       uiSessionId,
@@ -603,8 +645,8 @@ export async function chatCompletions(c: Context) {
       streamOptions: body.stream_options,
       sessionId: activeSession?.sessionId,
       onStreamDone: () => {
-        updateSessionState();
-        releaseSessionFlight();
+        doUpdateSessionState();
+        releaseMySession();
       },
     });
   } catch (err: any) {
@@ -633,6 +675,10 @@ export async function chatCompletions(c: Context) {
       errorCode: err.upstreamCode,
       errorMessage: err.message,
       accountId: 'unknown',
+      accountSelectionMs: timer.elapsed('sessionReady'),
+      streamCreationMs: timer.elapsed('streamReady') - timer.elapsed('streamStart'),
+      ttfbMs: undefined,
+      cacheHit: false,
     });
     console.error('Error in chatCompletions:', err)
     if (dbg.isEnabled()) {
@@ -648,7 +694,7 @@ export async function chatCompletions(c: Context) {
     if (status >= 500) {
       metrics.increment('requests.errors')
     }
-    releaseSessionFlight();
+    releaseMySession();
     return c.json({ error: { message: err.message } }, status)
   }
 }

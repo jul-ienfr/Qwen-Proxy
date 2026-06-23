@@ -8,6 +8,48 @@ import type { Context } from "hono";
 import { getQwenHeaders } from "../services/playwright.js";
 import crypto from "crypto";
 
+/** Shared extension-to-MIME map (dot-prefixed keys). */
+const MIME_MAP: Record<string, string> = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+  '.bmp': 'image/bmp', '.tiff': 'image/tiff', '.tif': 'image/tiff',
+  '.ico': 'image/x-icon', '.heic': 'image/heic', '.heif': 'image/heif',
+  '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime',
+  '.avi': 'video/x-msvideo', '.mkv': 'video/x-matroska',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.ogg': 'audio/ogg',
+  '.flac': 'audio/flac', '.aac': 'audio/aac',
+  '.pdf': 'application/pdf', '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json',
+  '.xml': 'application/xml', '.html': 'text/html', '.css': 'text/css',
+  '.js': 'application/javascript', '.zip': 'application/zip',
+  '.gz': 'application/gzip', '.tar': 'application/x-tar',
+  '.7z': 'application/x-7z-compressed',
+};
+
+/**
+ * Validate URLs before fetching to prevent SSRF attacks.
+ * Blocks private IPs, localhost, link-local, cloud metadata endpoints.
+ */
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const hostname = parsed.hostname;
+    if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1") return false;
+    if (hostname.startsWith("192.168.") || hostname.startsWith("10.") || hostname.startsWith("172.")) return false;
+    if (hostname.startsWith("169.254.")) return false; // link-local / cloud metadata
+    if (hostname === "0.0.0.0") return false;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 interface STSResponse {
   success: boolean;
   request_id: string;
@@ -160,43 +202,7 @@ async function uploadToOSS(
 
   const buffer = Buffer.from(fileBuffer);
   const ext = filename.split(".").pop()?.toLowerCase() || "";
-  const mimeMap: Record<string, string> = {
-    // Images
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    gif: "image/gif",
-    webp: "image/webp",
-    // Video
-    mp4: "video/mp4",
-    mov: "video/quicktime",
-    avi: "video/x-msvideo",
-    webm: "video/webm",
-    mkv: "video/x-matroska",
-    // Audio
-    mp3: "audio/mpeg",
-    wav: "audio/wav",
-    ogg: "audio/ogg",
-    flac: "audio/flac",
-    m4a: "audio/mp4",
-    aac: "audio/aac",
-    // Documents
-    pdf: "application/pdf",
-    doc: "application/msword",
-    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    xls: "application/vnd.ms-excel",
-    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ppt: "application/vnd.ms-powerpoint",
-    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    txt: "text/plain",
-    md: "text/markdown",
-    csv: "text/csv",
-    json: "application/json",
-    xml: "application/xml",
-    html: "text/html",
-    zip: "application/zip",
-  };
-  const contentType = mimeMap[ext] || "application/octet-stream";
+  const contentType = MIME_MAP['.' + ext] || "application/octet-stream";
 
   await client.put(file_path, buffer, {
     headers: { "Content-Type": contentType },
@@ -222,39 +228,7 @@ export async function uploadFile(c: Context) {
     let fileType = file.type;
     if (fileType === "application/octet-stream" || !fileType) {
       const ext = file.name.split(".").pop()?.toLowerCase() || "";
-      const extMimeMap: Record<string, string> = {
-        jpg: "image/jpeg",
-        jpeg: "image/jpeg",
-        png: "image/png",
-        gif: "image/gif",
-        webp: "image/webp",
-        mp4: "video/mp4",
-        mov: "video/quicktime",
-        avi: "video/x-msvideo",
-        webm: "video/webm",
-        mkv: "video/x-matroska",
-        mp3: "audio/mpeg",
-        wav: "audio/wav",
-        ogg: "audio/ogg",
-        flac: "audio/flac",
-        m4a: "audio/mp4",
-        aac: "audio/aac",
-        pdf: "application/pdf",
-        doc: "application/msword",
-        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        xls: "application/vnd.ms-excel",
-        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ppt: "application/vnd.ms-powerpoint",
-        pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        txt: "text/plain",
-        md: "text/markdown",
-        csv: "text/csv",
-        json: "application/json",
-        xml: "application/xml",
-        html: "text/html",
-        zip: "application/zip",
-      };
-      fileType = extMimeMap[ext] || "application/octet-stream";
+      fileType = MIME_MAP['.' + ext] || "application/octet-stream";
     }
 
     // Determine media category for size limits
@@ -371,205 +345,22 @@ function detectFileType(filename: string): {
   qwenFileType: string;
 } {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
+  const mime = MIME_MAP['.' + ext] || "application/octet-stream";
 
-  const typeMap: Record<
-    string,
-    { mime: string; showType: string; fileClass: string; qwenFileType: string }
-  > = {
-    // Images
-    png: {
-      mime: "image/png",
-      showType: "image",
-      fileClass: "vision",
-      qwenFileType: "image",
-    },
-    jpg: {
-      mime: "image/jpeg",
-      showType: "image",
-      fileClass: "vision",
-      qwenFileType: "image",
-    },
-    jpeg: {
-      mime: "image/jpeg",
-      showType: "image",
-      fileClass: "vision",
-      qwenFileType: "image",
-    },
-    gif: {
-      mime: "image/gif",
-      showType: "image",
-      fileClass: "vision",
-      qwenFileType: "image",
-    },
-    webp: {
-      mime: "image/webp",
-      showType: "image",
-      fileClass: "vision",
-      qwenFileType: "image",
-    },
-    // Video
-    mp4: {
-      mime: "video/mp4",
-      showType: "video",
-      fileClass: "video",
-      qwenFileType: "video",
-    },
-    mov: {
-      mime: "video/quicktime",
-      showType: "video",
-      fileClass: "video",
-      qwenFileType: "video",
-    },
-    avi: {
-      mime: "video/x-msvideo",
-      showType: "video",
-      fileClass: "video",
-      qwenFileType: "video",
-    },
-    webm: {
-      mime: "video/webm",
-      showType: "video",
-      fileClass: "video",
-      qwenFileType: "video",
-    },
-    mkv: {
-      mime: "video/x-matroska",
-      showType: "video",
-      fileClass: "video",
-      qwenFileType: "video",
-    },
-    // Audio
-    mp3: {
-      mime: "audio/mpeg",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    wav: {
-      mime: "audio/wav",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    ogg: {
-      mime: "audio/ogg",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    flac: {
-      mime: "audio/flac",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    m4a: {
-      mime: "audio/mp4",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    aac: {
-      mime: "audio/aac",
-      showType: "audio",
-      fileClass: "audio",
-      qwenFileType: "audio",
-    },
-    // Documents
-    pdf: {
-      mime: "application/pdf",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    doc: {
-      mime: "application/msword",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    docx: {
-      mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    xls: {
-      mime: "application/vnd.ms-excel",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    xlsx: {
-      mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    ppt: {
-      mime: "application/vnd.ms-powerpoint",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    pptx: {
-      mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    txt: {
-      mime: "text/plain",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    md: {
-      mime: "text/markdown",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    csv: {
-      mime: "text/csv",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    json: {
-      mime: "application/json",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    xml: {
-      mime: "application/xml",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    html: {
-      mime: "text/html",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-    zip: {
-      mime: "application/zip",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    },
-  };
+  let showType: string;
+  let fileClass: string;
+  let qwenFileType: string;
+  if (mime.startsWith("image/")) {
+    showType = "image"; fileClass = "vision"; qwenFileType = "image";
+  } else if (mime.startsWith("video/")) {
+    showType = "video"; fileClass = "video"; qwenFileType = "video";
+  } else if (mime.startsWith("audio/")) {
+    showType = "audio"; fileClass = "audio"; qwenFileType = "audio";
+  } else {
+    showType = "file"; fileClass = "file"; qwenFileType = "file";
+  }
 
-  return (
-    typeMap[ext] || {
-      mime: "application/octet-stream",
-      showType: "file",
-      fileClass: "file",
-      qwenFileType: "file",
-    }
-  );
+  return { mime, showType, fileClass, qwenFileType };
 }
 
 /**
@@ -613,12 +404,39 @@ export async function processImagesForQwen(
 
       if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
         try {
-          const downloadRes = await fetch(mediaUrl);
+          if (!isSafeUrl(mediaUrl)) {
+            console.error(`[Upload] URL rejected (SSRF): ${mediaUrl}`);
+            continue;
+          }
+
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 60_000); // 60s timeout
+
+          let downloadRes: Response;
+          try {
+            downloadRes = await fetch(mediaUrl, { signal: controller.signal });
+          } finally {
+            clearTimeout(timeoutId);
+          }
+
           if (!downloadRes.ok) {
             console.error(`[Upload] Failed to download media: ${downloadRes.status} ${mediaUrl}`);
             continue;
           }
+
+          // Check content-length before downloading to enforce size limit
+          const contentLength = downloadRes.headers.get("content-length");
+          if (contentLength && parseInt(contentLength) > 20 * 1024 * 1024) { // 20MB limit
+            console.error(`[Upload] Remote file too large: ${contentLength} bytes (max 20MB)`);
+            continue;
+          }
+
           const buffer = Buffer.from(await downloadRes.arrayBuffer());
+          // Enforce size limit on actual downloaded data
+          if (buffer.length > 20 * 1024 * 1024) {
+            console.error(`[Upload] Downloaded file too large: ${buffer.length} bytes (max 20MB)`);
+            continue;
+          }
           fileSize = buffer.length;
           filename = mediaUrl.split("/").pop()?.split("?")[0] || "file.bin";
           if (!filename.includes(".")) {

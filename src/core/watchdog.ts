@@ -12,6 +12,7 @@ export class Watchdog extends EventEmitter {
   private checkInterval: NodeJS.Timeout | null = null
   private consecutiveFailures: number = 0
   private recoveryInProgress: boolean = false
+  private lastCheckTime = 0
 
   start(): void {
     if (this.checkInterval) return
@@ -31,6 +32,20 @@ export class Watchdog extends EventEmitter {
       ram: this.checkRAM(),
       streams: this.checkStreams(),
       overall: 'healthy',
+    }
+
+    // Report detailed memory metrics
+    const mem = process.memoryUsage()
+    metrics.gauge('watchdog.memory.heap_used_mb', Math.round(mem.heapUsed / 1024 / 1024))
+    metrics.gauge('watchdog.memory.heap_total_mb', Math.round(mem.heapTotal / 1024 / 1024))
+    metrics.gauge('watchdog.memory.rss_mb', Math.round(mem.rss / 1024 / 1024))
+    metrics.gauge('watchdog.memory.external_mb', Math.round(mem.external / 1024 / 1024))
+
+    // Event loop lag detection
+    const eventLoopLag = this.checkEventLoopLag()
+    metrics.gauge('watchdog.event_loop_lag_ms', eventLoopLag)
+    if (eventLoopLag > 1000) {
+      console.warn(`[Watchdog] Event loop lag: ${eventLoopLag}ms`)
     }
 
     status.overall = this.calculateOverall(status)
@@ -63,6 +78,18 @@ export class Watchdog extends EventEmitter {
     if (activeStreams > config.watchdog.streams.criticalThreshold) return 'blocked'
     if (activeStreams > config.watchdog.streams.warningThreshold) return 'congested'
     return 'ok'
+  }
+
+  private checkEventLoopLag(): number {
+    const now = Date.now()
+    if (this.lastCheckTime === 0) {
+      this.lastCheckTime = now
+      return 0
+    }
+    const expected = config.watchdog.checkInterval
+    const actual = now - this.lastCheckTime
+    this.lastCheckTime = now
+    return Math.max(0, actual - expected)
   }
 
   private calculateOverall(status: HealthStatus): 'healthy' | 'degraded' | 'unhealthy' {
@@ -101,7 +128,14 @@ export class Watchdog extends EventEmitter {
   }
 
   private async recoverRAM(): Promise<void> {
-    if (global.gc) global.gc()
+    if (global.gc) {
+      const before = process.memoryUsage().heapUsed
+      global.gc()
+      const after = process.memoryUsage().heapUsed
+      const freed = Math.round((before - after) / 1024 / 1024)
+      console.log(`[Watchdog] GC freed ${freed}MB (before: ${Math.round(before/1024/1024)}MB, after: ${Math.round(after/1024/1024)}MB)`)
+      metrics.increment('watchdog.gc.freed_mb', freed)
+    }
     await new Promise(resolve => setTimeout(resolve, 100))
     this.emit('recovery:ram:freed')
   }

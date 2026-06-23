@@ -37,6 +37,12 @@ Proxy API local compatível com OpenAI que roteia requisições para os modelos 
 - **CLI Binary** — Instale globalmente via npm e use o comando `qwenproxy` diretamente.
 - **Docker Ready** — Deploy para VPS com Docker, volumes persistentes e graceful shutdown.
 - **⚡ Speed Optimization** — Zero-copy stream, TLS pool, CDP batching, WebSocket bridge, browser-direct mode, Service Worker cache (6x faster, 240x on cache hit).
+- **Refactored Architecture** — Code deduplicated across protocols, `createQwenStream` decomposed into testable sub-functions, shared `request-executor.ts` module.
+- **Hot-Reload Config** — 18 configurable keys modifiable at runtime via API/dashboard (rate limiter, circuit breaker, timeouts, cache TTL, etc.).
+- **Sliding Window Rate Limiter** — No more burst at window boundaries, accurate retry-after headers.
+- **Request Timing** — TTFB, stream creation time, cache hit tracking per request.
+- **Mutex-Protected Browser** — Account context creation/reset protected against race conditions.
+- **Enhanced Monitoring** — Memory metrics (heap/RSS/external), event loop lag, GC stats, cache memory, warm pool stats, active sessions in `/health`.
 
 ---
 
@@ -84,6 +90,14 @@ Data Plane (Browser) ←→ Qwen API direct (HTTPS)
 **Benchmark:** `npm run bench`
 **Docs:** [SPEED.md](SPEED.md)
 
+### Monitoring Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/health` | Full health check with 10 subsystem checks (browser, accounts, cache, warm pool, TLS pool, sessions, debug, memory, event loop lag) |
+| `/metrics` | Prometheus-format metrics |
+| `/v1/performance` | Real-time latency tracking, path selection, TLS pool stats |
+
 ---
 
 ## ⚙️ Hot-Reload Configuration
@@ -130,6 +144,16 @@ Acesse `http://localhost:3000` → aba **⚙️ Paramètres** para editar todos 
 ### Persistência
 
 As alterações são salvas em `config/runtime-config.json` e restauradas automaticamente no próximo início do servidor.
+
+### New Hot-Reloadable Keys (v1.8.0+)
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `rateLimit.windowMs` | number | 60000 | Rate limiter window (ms) |
+| `rateLimit.maxRequests` | number | 100 | Max requests per window |
+| `circuitBreaker.failureThreshold` | number | 5 | Failures before opening circuit |
+| `circuitBreaker.resetTimeoutMs` | number | 60000 | Timeout before half-open (ms) |
+| `circuitBreaker.successThreshold` | number | 3 | Successes to close circuit |
 
 ---
 
@@ -419,6 +443,7 @@ qwenproxy/
 │   │   ├── stream-registry.ts   # Tracking de streams ativos
 │   │   └── watchdog.ts          # Health monitoring
 │   ├── routes/
+│   │   ├── request-executor.ts   # Shared session/account logic (deduplication)
 │   │   ├── chat.ts              # Handler /v1/chat/completions
 │   │   ├── sse-parser.ts        # Parser incremental de SSE + delta
 │   │   ├── stream-handler.ts    # Orquestração de streaming SSE

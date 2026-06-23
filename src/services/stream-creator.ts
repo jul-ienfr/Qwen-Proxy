@@ -8,7 +8,6 @@ import { getDebugLogger } from '../core/debug-logger.js';
 import { browserStreamFetchWS } from './stream-ws-bridge.js';
 
 const CACHED_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-const BASE_TIMEOUT_MS = 120000;
 const TIMEOUT_PER_MB = 30000;
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -219,7 +218,10 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
       }
     };
 
-    console.log(`[Qwen] Disabling native tools for ${cacheKey}...`);
+    const dbg = getDebugLogger();
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', `Disabling native tools for ${cacheKey}`, { cacheKey });
+    }
     const page = getPageForAccount(accountId);
     if (page && !page.isClosed() && page.url().includes('chat.qwen.ai')) {
       try {
@@ -235,7 +237,9 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
           timeoutMs: config.timeouts.http,
         });
         if (result.status && result.status < 400) {
-          console.log(`[Qwen] Native tools disabled successfully for ${cacheKey}.`);
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-creator.ts', `Native tools disabled successfully for ${cacheKey}`, { cacheKey });
+          }
           nativeToolsDisabled.add(cacheKey);
           return;
         }
@@ -272,7 +276,9 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
       const text = await response.text();
       console.error(`[Qwen] Failed to disable native tools for ${cacheKey}: ${response.status} - ${text}`);
     } else {
-      console.log(`[Qwen] Native tools disabled successfully for ${cacheKey}.`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Native tools disabled successfully for ${cacheKey} (direct)`, { cacheKey });
+      }
       nativeToolsDisabled.add(cacheKey);
     }
   } catch (err: any) {
@@ -362,6 +368,101 @@ function processModelsJson(json: any): any[] {
   }
 
   return [];
+}
+
+async function processMultimodalFiles(
+  pendingMultimodal: Array<Array<{ type: string; text?: string; image_url?: { url: string }; video_url?: { url: string }; audio_url?: { url: string }; file_url?: { url: string } }>>,
+  chatHeaders: Record<string, string>,
+  accountId: string | undefined,
+): Promise<QwenFileEntry[]> {
+  const { processImagesForQwen } = await import('../routes/upload.js');
+  const { headers: fullHeaders } = await getQwenHeaders(false, accountId);
+  const uploadHeaders: Record<string, string> = {
+    cookie: fullHeaders['cookie'] || chatHeaders['cookie'] || '',
+    'user-agent': fullHeaders['user-agent'] || chatHeaders['user-agent'] || '',
+    'bx-ua': fullHeaders['bx-ua'] || '',
+    'bx-umidtoken': fullHeaders['bx-umidtoken'] || '',
+    'bx-v': fullHeaders['bx-v'] || chatHeaders['bx-v'] || '',
+  };
+  if (!uploadHeaders['bx-ua']) {
+    console.warn('[Qwen] Missing bx-ua header for multimodal upload, attempting forced refresh...');
+    const { headers: refreshedHeaders } = await getQwenHeaders(true, accountId);
+    uploadHeaders['cookie'] = refreshedHeaders['cookie'] || uploadHeaders['cookie'];
+    uploadHeaders['user-agent'] = refreshedHeaders['user-agent'] || uploadHeaders['user-agent'];
+    uploadHeaders['bx-ua'] = refreshedHeaders['bx-ua'] || '';
+    uploadHeaders['bx-umidtoken'] = refreshedHeaders['bx-umidtoken'] || '';
+    uploadHeaders['bx-v'] = refreshedHeaders['bx-v'] || uploadHeaders['bx-v'];
+  }
+  const results = await Promise.all(
+    pendingMultimodal.map(parts => processImagesForQwen(parts, uploadHeaders))
+  );
+  const files: QwenFileEntry[] = [];
+  for (const r of results) {
+    files.push(...r.files);
+  }
+  return files;
+}
+
+export function buildCompletionPayload(args: {
+  chatId: string;
+  modelId: string;
+  enableThinking: boolean;
+  thinkingMode: string | undefined;
+  prompt: string;
+  parentId: string | null;
+  files: QwenFileEntry[];
+  accountId: string | undefined;
+}): { payloadJson: string; payloadSize: number; timeoutMs: number } {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const fid = crypto.randomUUID();
+  const model = args.modelId.replace('-no-thinking', '');
+
+  const payload: QwenPayload = {
+    stream: true,
+    version: '2.1',
+    incremental_output: true,
+    chat_id: args.chatId,
+    chat_mode: args.accountId === 'guest' ? 'guest' : 'normal',
+    model: model,
+    parent_id: args.parentId,
+    messages: [
+      {
+        fid,
+        parentId: args.parentId,
+        childrenIds: [],
+        role: 'user',
+        content: args.prompt,
+        user_action: 'chat',
+        files: args.files,
+        timestamp,
+        models: [model],
+        chat_type: 't2t',
+        feature_config: {
+          thinking_enabled: args.enableThinking,
+          output_schema: 'phase',
+          research_mode: 'normal',
+          auto_thinking: false,
+          thinking_mode: args.thinkingMode || 'Thinking',
+          thinking_format: 'summary',
+          auto_search: false,
+        },
+        extra: { meta: { subChatType: 't2t' } },
+        sub_chat_type: 't2t',
+        parent_id: args.parentId,
+      },
+    ],
+    timestamp: timestamp + 1,
+  };
+
+  const payloadJson = JSON.stringify(payload);
+  const payloadSize = Buffer.byteLength(payloadJson);
+  if (payloadSize > MAX_PAYLOAD_SIZE) {
+    throw new Error(`Payload too large: ${payloadSize} bytes exceeds limit of ${MAX_PAYLOAD_SIZE} bytes`);
+  }
+  const payloadMB = payloadSize / (1024 * 1024);
+  const timeoutMs = config.timeouts.chat + Math.ceil(payloadMB * TIMEOUT_PER_MB);
+
+  return { payloadJson, payloadSize, timeoutMs };
 }
 
 export async function createQwenStream(
@@ -490,37 +591,17 @@ export async function createQwenStream(
   }
 
   const chatSetupMs = Date.now() - streamStartMs;
-  console.log(`[Qwen] Chat setup completed in ${chatSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+  if (dbg.isEnabled()) {
+    dbg.log('STREAM', 'stream-creator.ts', `Chat setup completed in ${chatSetupMs}ms`, { chatId, account: accountId || 'guest', chatSetupMs });
+  }
 
   const actualParentId: string | null = sessionContext?.parentId ?? null;
 
-  const resolvedFiles = files || [];
+  let resolvedFiles = [...(files || [])];
   if (pendingMultimodal && pendingMultimodal.length > 0 && resolvedFiles.length === 0) {
     try {
-      const { processImagesForQwen } = await import('../routes/upload.js');
-      const { headers: fullHeaders } = await getQwenHeaders(false, accountId);
-      const uploadHeaders: Record<string, string> = {
-        cookie: fullHeaders['cookie'] || chatHeaders['cookie'] || '',
-        'user-agent': fullHeaders['user-agent'] || chatHeaders['user-agent'] || '',
-        'bx-ua': fullHeaders['bx-ua'] || '',
-        'bx-umidtoken': fullHeaders['bx-umidtoken'] || '',
-        'bx-v': fullHeaders['bx-v'] || chatHeaders['bx-v'] || '',
-      };
-      if (!uploadHeaders['bx-ua']) {
-        console.warn('[Qwen] Missing bx-ua header for multimodal upload, attempting forced refresh...');
-        const { headers: refreshedHeaders } = await getQwenHeaders(true, accountId);
-        uploadHeaders['cookie'] = refreshedHeaders['cookie'] || uploadHeaders['cookie'];
-        uploadHeaders['user-agent'] = refreshedHeaders['user-agent'] || uploadHeaders['user-agent'];
-        uploadHeaders['bx-ua'] = refreshedHeaders['bx-ua'] || '';
-        uploadHeaders['bx-umidtoken'] = refreshedHeaders['bx-umidtoken'] || '';
-        uploadHeaders['bx-v'] = refreshedHeaders['bx-v'] || uploadHeaders['bx-v'];
-      }
-      const results = await Promise.all(
-        pendingMultimodal.map(parts => processImagesForQwen(parts, uploadHeaders))
-      );
-      for (const r of results) {
-        resolvedFiles.push(...r.files);
-      }
+      const multimodalFiles = await processMultimodalFiles(pendingMultimodal, chatHeaders, accountId);
+      resolvedFiles.push(...multimodalFiles);
     } catch (err: any) {
       console.error('[Qwen] Failed to process multimodal uploads:', err.message);
       throw new Error(`Multimodal upload failed: ${err.message}`, { cause: err });
@@ -528,60 +609,12 @@ export async function createQwenStream(
   }
 
   try {
-    const timestamp = Math.floor(Date.now() / 1000);
-  const fid = crypto.randomUUID();
-  const model = modelId.replace('-no-thinking', '');
+    const { payloadJson, payloadSize, timeoutMs } = buildCompletionPayload({
+      chatId, modelId, enableThinking, thinkingMode, prompt,
+      parentId: actualParentId, files: resolvedFiles, accountId,
+    });
 
-  const payload: QwenPayload = {
-    stream: true,
-    version: '2.1',
-    incremental_output: true,
-    chat_id: chatId,
-    chat_mode: accountId === 'guest' ? 'guest' : 'normal',
-    model: model,
-    parent_id: actualParentId,
-    messages: [
-      {
-        fid: fid,
-        parentId: actualParentId,
-        childrenIds: [],
-        role: 'user',
-        content: prompt,
-        user_action: 'chat',
-        files: resolvedFiles,
-        timestamp: timestamp,
-        models: [model],
-        chat_type: 't2t',
-        feature_config: {
-          thinking_enabled: enableThinking,
-          output_schema: 'phase',
-          research_mode: 'normal',
-          auto_thinking: false,
-          thinking_mode: thinkingMode || 'Thinking',
-          thinking_format: 'summary',
-          auto_search: false
-        },
-        extra: {
-          meta: {
-            subChatType: 't2t'
-          }
-        },
-        sub_chat_type: 't2t',
-        parent_id: actualParentId
-      }
-    ],
-    timestamp: timestamp + 1
-  };
-
-  const payloadJson = JSON.stringify(payload);
-  const payloadSize = Buffer.byteLength(payloadJson);
-  if (payloadSize > MAX_PAYLOAD_SIZE) {
-    throw new Error(`Payload too large: ${payloadSize} bytes exceeds limit of ${MAX_PAYLOAD_SIZE} bytes`);
-  }
-  const payloadMB = payloadSize / (1024 * 1024);
-  const timeoutMs = BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB);
-
-  const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
+    const url = `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`;
 
   const completionHeaders: Record<string, string> = {
     'accept': 'text/event-stream',
@@ -599,77 +632,72 @@ export async function createQwenStream(
   const tryDirectFirst = config.directFetch && hasBrowser;
   const useBrowserOnly = !config.directFetch && hasBrowser;
 
-  // Helper: attempt direct Node.js fetch (with TLS pool for HTTP/2)
+  // Helper: attempt direct fetch via browserFetch (Chrome TLS, reliable)
   const tryDirectFetch = async (): Promise<{ stream: ReadableStream; controller: AbortController; headers: Record<string, string>; uiSessionId: string; freshChatId?: string } | null> => {
-    const directController = new AbortController();
-    const directTimeoutId = setTimeout(() => directController.abort(), timeoutMs);
+    const page = getPageForAccount(accountId);
+    if (!page || page.isClosed() || !page.url().includes('chat.qwen.ai')) {
+      console.warn('[Qwen] No valid browser page for direct fetch');
+      return null;
+    }
 
-    // Build headers for the request
-    const requestHeaders: Record<string, string> = {
-      'accept': 'application/json',
-      'accept-language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-      'content-type': 'application/json',
-      'cookie': chatHeaders['cookie'],
-      'origin': 'https://chat.qwen.ai',
-      'referer': accountId === 'guest' ? 'https://chat.qwen.ai/c/guest' : `https://chat.qwen.ai/c/${chatId}`,
-      'sec-fetch-dest': 'empty',
-      'sec-fetch-mode': 'cors',
-      'sec-fetch-site': 'same-origin',
-      'timezone': CACHED_TIMEZONE,
-      'user-agent': chatHeaders['user-agent'],
-      'x-accel-buffering': 'no',
-      'x-request-id': crypto.randomUUID(),
-      'bx-v': chatHeaders['bx-v'],
-      'bx-ua': chatHeaders['bx-ua'] || '',
-      'bx-umidtoken': chatHeaders['bx-umidtoken'] || '',
-      ...getClientHintsHeaders(),
-    };
+    // Check if page is actually responsive (CDP alive)
+    const { isPageHealthy } = await import('./browser-manager.js');
+    if (!(await isPageHealthy(page))) {
+      console.warn('[Qwen] Page not healthy for direct fetch, falling back to browser');
+      return null;
+    }
 
     try {
-      // Direct Node.js fetch — faster than TLS pool for streaming
-      // The TLS pool is used for non-streaming requests (warmup, chat creation)
-      const response = await fetch(url, {
+      // Use browserFetch — runs inside browser context with Chrome TLS fingerprint
+      const result = await browserFetch(page, url, {
         method: 'POST',
-        headers: requestHeaders,
+        headers: {
+          'accept': 'text/event-stream',
+          'content-type': 'application/json',
+          'x-request-id': crypto.randomUUID(),
+          'timezone': CACHED_TIMEZONE,
+        },
         body: payloadJson,
-        signal: directController.signal
+        timeoutMs: 15000,
       });
-      clearTimeout(directTimeoutId);
 
-      const responseContentType = response.headers.get('content-type') || '';
-      if (response.ok && responseContentType.includes('text/event-stream') && response.body) {
-        const tmdStream = addTmdPeekToStream(response.body);
+      if (result.status === 200 && result.contentType.includes('text/event-stream')) {
+        const bodyText = result.body || '';
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(bodyText));
+            controller.close();
+          }
+        });
+        const tmdStream = addTmdPeekToStream(stream);
         const controller = new AbortController();
-        return { stream: wrapLeasedStream(tmdStream, controller, timeoutMs, `Qwen direct stream ${chatId}`), controller, headers: chatHeaders, uiSessionId: chatId };
+        if (dbg.isEnabled()) {
+          dbg.log('STREAM', 'stream-creator.ts', `browserFetch direct success (${bodyText.length} bytes)`, { chatId, bytes: bodyText.length });
+        }
+        return { stream: wrapLeasedStream(tmdStream, controller, timeoutMs, `Qwen browserFetch direct ${chatId}`), controller, headers: chatHeaders, uiSessionId: chatId };
       }
 
-      // Check for TMD challenge
-      if (response.ok && response.body) {
-        const peekText = await response.clone().text().catch(() => '');
-        if (peekText.includes('FAIL_SYS_USER_VALIDATE') || peekText.includes('_____tmd_____') || peekText.includes('RGV587_ERROR')) {
-          console.warn('[Qwen] Direct fetch got TMD challenge, will fallback to browser');
-          return null; // Signal to fallback
-        }
-        handleErrorBody(peekText, response.status);
-      }
-
-      if (!response.ok) {
-        const errText = await response.text().catch(() => '');
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          handleJsonErrorBody(errText);
-        }
-        throw new Error(`Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`);
-      }
-    } catch (err: any) {
-      clearTimeout(directTimeoutId);
-      if (err instanceof QwenUpstreamError) throw err;
-      // TMD-related errors should trigger fallback
-      if (err.message?.includes('TMD') || err.message?.includes('FAIL_SYS_USER_VALIDATE')) {
-        console.warn('[Qwen] Direct fetch TMD error, will fallback to browser');
+      // Check for TMD
+      if (result.body && (
+        result.body.includes('FAIL_SYS_USER_VALIDATE') ||
+        result.body.includes('_____tmd_____') ||
+        result.body.includes('RGV587_ERROR')
+      )) {
+        console.warn('[Qwen] browserFetch got TMD — refreshing headers...');
+        try {
+          const { getQwenHeaders } = await import('./header-interceptor.js');
+          await getQwenHeaders(true, accountId);
+        } catch {}
         return null;
       }
-      throw err;
+
+      if (result.status >= 400) {
+        throw new Error(`browserFetch failed: ${result.status} - ${result.body?.substring(0, 200)}`);
+      }
+    } catch (err: any) {
+      if (err instanceof QwenUpstreamError) throw err;
+      console.warn(`[Qwen] browserFetch direct error: ${err.message?.substring(0, 100)}`);
+      return null;
     }
     return null;
   };
@@ -682,19 +710,97 @@ export async function createQwenStream(
     const targetUrl = freshChatId ? `https://chat.qwen.ai/api/v2/chat/completions?chat_id=${freshChatId}` : url;
 
     try {
-      // Use WebSocket bridge for 50-200x faster streaming when enabled
-      const fetchFn = config.useWsBridge ? browserStreamFetchWS : browserStreamFetch;
-      const browserResult = await fetchFn(page, targetUrl, {
-        method: 'POST',
-        headers: completionHeaders,
-        body: payloadJson,
-        timeoutMs,
-      });
+      // Use browserFetch (non-streaming, reliable) — CDP streaming bridge is broken
+      let browserResult: any = null;
+      let lastBrowserError: any = null;
+      const maxBrowserRetries = 3;
+      const browserAttemptTimeout = 15000; // 15s per attempt
+      for (let attempt = 0; attempt < maxBrowserRetries; attempt++) {
+        if (dbg.isEnabled()) {
+          dbg.log('STREAM', 'stream-creator.ts', `Browser fetch attempt ${attempt + 1}/${maxBrowserRetries}`, { chatId: targetChatId, attempt: attempt + 1, maxRetries: maxBrowserRetries });
+        }
+        try {
+          browserResult = await browserFetch(page, targetUrl, {
+            method: 'POST',
+            headers: completionHeaders,
+            body: payloadJson,
+            timeoutMs: browserAttemptTimeout,
+          });
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-creator.ts', `Browser fetch attempt ${attempt + 1} returned`, { chatId: targetChatId, attempt: attempt + 1, status: browserResult?.status, contentType: browserResult?.contentType?.substring(0, 30) });
+          }
+        } catch (fetchErr: any) {
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-creator.ts', `Browser fetch attempt ${attempt + 1} failed`, { chatId: targetChatId, attempt: attempt + 1, error: fetchErr.message?.substring(0, 100) });
+          }
+          lastBrowserError = fetchErr;
+          if (attempt < maxBrowserRetries - 1) {
+            if (dbg.isEnabled()) {
+              dbg.log('STREAM', 'stream-creator.ts', 'Waiting 5s for captcha solve before retry', { chatId: targetChatId });
+            }
+            await sleep(5000);
+            continue;
+          }
+          break;
+        }
+
+        if (browserResult.contentType.includes('text/event-stream') && browserResult.status < 400) {
+          break; // Success!
+        }
+
+        // Log the response body for debugging
+        if (dbg.isEnabled()) {
+          dbg.log('STREAM', 'stream-creator.ts', 'Browser response details', { chatId: targetChatId, status: browserResult.status, contentType: browserResult.contentType, body: browserResult.body?.substring(0, 200) });
+        }
+
+        // If we got a non-SSE response, check if it's a captcha/TMD issue
+        if (browserResult.body && (
+          browserResult.body.includes('FAIL_SYS_USER_VALIDATE') ||
+          browserResult.body.includes('_____tmd_____') ||
+          browserResult.body.includes('RGV587_ERROR')
+        )) {
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-creator.ts', `Browser fetch got TMD challenge (attempt ${attempt + 1}/${maxBrowserRetries}). Waiting for captcha solve`, { chatId: targetChatId, attempt: attempt + 1 });
+          }
+          await sleep(2000); // Wait 2s for captcha to be solved
+          continue;
+        }
+
+        // Transient errors — retry with short delay
+        if (lastBrowserError?.message?.includes('context was destroyed') ||
+            lastBrowserError?.message?.includes('Failed to fetch') ||
+            lastBrowserError?.message?.includes('navigation')) {
+          if (dbg.isEnabled()) {
+            dbg.log('STREAM', 'stream-creator.ts', 'Transient error, retrying', { chatId: targetChatId, error: lastBrowserError?.message?.substring(0, 100) });
+          }
+          await sleep(1000);
+          continue;
+        }
+
+        // Other error - don't retry
+        break;
+      }
+
+      // If all browser attempts failed, throw the last error
+      if (!browserResult && lastBrowserError) {
+        throw lastBrowserError;
+      }
 
       if (browserResult.contentType.includes('text/event-stream') && browserResult.status < 400) {
-        const tmdStream = addTmdPeekToStream(browserResult.stream);
+        // Convert body string to ReadableStream for the pipeline
+        const bodyText = browserResult.body || '';
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(bodyText));
+            controller.close();
+          }
+        });
+        const tmdStream = addTmdPeekToStream(stream);
         const controller = new AbortController();
-        return { stream: wrapLeasedStream(tmdStream, controller, timeoutMs, `Qwen browser stream ${targetChatId}`, browserResult.abort), controller, headers: chatHeaders, uiSessionId: targetChatId };
+        if (dbg.isEnabled()) {
+          dbg.log('STREAM', 'stream-creator.ts', `Browser fetch success (${bodyText.length} bytes)`, { chatId: targetChatId, bytes: bodyText.length });
+        }
+        return { stream: wrapLeasedStream(tmdStream, controller, timeoutMs, `Qwen browser stream ${targetChatId}`), controller, headers: chatHeaders, uiSessionId: targetChatId };
       }
 
       if (browserResult.body) {
@@ -707,7 +813,7 @@ export async function createQwenStream(
 
             const freshChatBody = JSON.stringify({
               title: 'Nova Conversa',
-              models: [model.replace('-no-thinking', '')],
+              models: [modelId.replace('-no-thinking', '')],
               chat_mode: accountId === 'guest' ? 'guest' : 'normal',
               chat_type: 't2t',
               timestamp: Date.now(),
@@ -763,47 +869,100 @@ export async function createQwenStream(
   // Execute fetch strategy with fallback
   if (tryDirectFirst) {
     // DIRECT_FETCH=true: Try direct first, fallback to browser on TMD
-    console.log(`[Qwen] Trying direct fetch for chatId: ${chatId}`);
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', `Trying direct fetch`, { chatId, account: accountId || 'guest' });
+    }
     const directResult = await tryDirectFetch();
     if (directResult) {
       const totalSetupMs = Date.now() - streamStartMs;
-      console.log(`[Qwen] Direct stream created in ${totalSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Direct stream created in ${totalSetupMs}ms`, { chatId, account: accountId || 'guest', totalSetupMs });
+      }
       return { stream: directResult.stream, headers: directResult.headers, uiSessionId: directResult.uiSessionId, controller: directResult.controller, accountId: accountId || 'guest' };
     }
     // Fallback to browser
-    console.log(`[Qwen] Falling back to browser fetch for chatId: ${chatId}`);
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', 'Falling back to browser fetch', { chatId, account: accountId || 'guest' });
+    }
     const browserResult = await tryBrowserFetch();
     if (browserResult) {
       const totalSetupMs = Date.now() - streamStartMs;
-      console.log(`[Qwen] Browser fallback stream created in ${totalSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Browser fallback stream created in ${totalSetupMs}ms`, { chatId, account: accountId || 'guest', totalSetupMs });
+      }
       return { stream: browserResult.stream, headers: browserResult.headers, uiSessionId: browserResult.uiSessionId, controller: browserResult.controller, accountId: accountId || 'guest' };
     }
   } else if (useBrowserOnly) {
     // DIRECT_FETCH=false: Use browser, fallback to direct on error
-    console.log(`[Qwen] Trying browser fetch for chatId: ${chatId}`);
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', 'Trying browser fetch', { chatId, account: accountId || 'guest' });
+    }
     const browserResult = await tryBrowserFetch();
     if (browserResult) {
       const totalSetupMs = Date.now() - streamStartMs;
-      console.log(`[Qwen] Browser stream created in ${totalSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Browser stream created in ${totalSetupMs}ms`, { chatId, account: accountId || 'guest', totalSetupMs });
+      }
       return { stream: browserResult.stream, headers: browserResult.headers, uiSessionId: browserResult.uiSessionId, controller: browserResult.controller, accountId: accountId || 'guest' };
     }
     // Fallback to direct
-    console.log(`[Qwen] Falling back to direct fetch for chatId: ${chatId}`);
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', 'Falling back to direct fetch', { chatId, account: accountId || 'guest' });
+    }
     const directResult = await tryDirectFetch();
     if (directResult) {
       const totalSetupMs = Date.now() - streamStartMs;
-      console.log(`[Qwen] Direct fallback stream created in ${totalSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Direct fallback stream created in ${totalSetupMs}ms`, { chatId, account: accountId || 'guest', totalSetupMs });
+      }
       return { stream: directResult.stream, headers: directResult.headers, uiSessionId: directResult.uiSessionId, controller: directResult.controller, accountId: accountId || 'guest' };
     }
   } else {
     // No browser available, direct only
-    console.log(`[Qwen] Direct fetch only (no browser) for chatId: ${chatId}`);
+    if (dbg.isEnabled()) {
+      dbg.log('STREAM', 'stream-creator.ts', 'Direct fetch only (no browser)', { chatId, account: accountId || 'guest' });
+    }
     const directResult = await tryDirectFetch();
     if (directResult) {
       const totalSetupMs = Date.now() - streamStartMs;
-      console.log(`[Qwen] Direct stream created in ${totalSetupMs}ms (chatId: ${chatId}, account: ${accountId || 'guest'})`);
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', `Direct stream created in ${totalSetupMs}ms (no browser)`, { chatId, account: accountId || 'guest', totalSetupMs });
+      }
       return { stream: directResult.stream, headers: directResult.headers, uiSessionId: directResult.uiSessionId, controller: directResult.controller, accountId: accountId || 'guest' };
     }
+  }
+
+  // Auto-recovery: if all methods failed, reset browser profiles AND refresh headers, then retry once
+  if (dbg.isEnabled()) {
+    dbg.log('STREAM', 'stream-creator.ts', 'All fetch methods failed — attempting auto-recovery', { chatId, account: accountId || 'guest' });
+  }
+  try {
+    const { resetBrowserProfile } = await import('./browser-manager.js');
+    const { getQwenHeaders } = await import('./header-interceptor.js');
+    const acctId = accountId || 'global';
+    await resetBrowserProfile(acctId, accountId).catch(() => {});
+    // Force refresh headers with fresh browser session
+    await getQwenHeaders(true, accountId).catch(() => {});
+
+    // Retry once after reset
+    if (tryDirectFirst || !hasBrowser) {
+      const retryResult = await tryDirectFetch();
+      if (retryResult) {
+        if (dbg.isEnabled()) {
+          dbg.log('STREAM', 'stream-creator.ts', 'Auto-recovery succeeded (direct)', { chatId, account: accountId || 'guest' });
+        }
+        return { stream: retryResult.stream, headers: retryResult.headers, uiSessionId: retryResult.uiSessionId, controller: retryResult.controller, accountId: accountId || 'guest' };
+      }
+    }
+    const retryBrowser = await tryBrowserFetch();
+    if (retryBrowser) {
+      if (dbg.isEnabled()) {
+        dbg.log('STREAM', 'stream-creator.ts', 'Auto-recovery succeeded (browser)', { chatId, account: accountId || 'guest' });
+      }
+      return { stream: retryBrowser.stream, headers: retryBrowser.headers, uiSessionId: retryBrowser.uiSessionId, controller: retryBrowser.controller, accountId: accountId || 'guest' };
+    }
+  } catch (retryErr) {
+    console.warn(`[Qwen] Auto-recovery retry failed:`, (retryErr as Error).message);
   }
 
   throw new QwenUpstreamError('All fetch methods failed (direct and browser)', 'FETCH_FAILED', 502);

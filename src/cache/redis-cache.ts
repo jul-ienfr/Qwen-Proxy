@@ -115,9 +115,14 @@ class UpstashClient {
 
 // ─── In-Memory Fallback ──────────────────────────────────────────────────────
 
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 class MemoryClient {
   private store = new Map<string, { value: string; expiresAt?: number }>();
   private hashStore = new Map<string, Map<string, string>>();
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   private isExpired(entry: { value: string; expiresAt?: number }): boolean {
     return entry.expiresAt !== undefined && Date.now() > entry.expiresAt;
@@ -142,7 +147,8 @@ class MemoryClient {
   }
 
   async keys(pattern: string): Promise<string[]> {
-    const regex = new RegExp('^' + pattern.replace(/\*/g, '.*') + '$');
+    const escaped = escapeRegex(pattern).replace(/\\\*/g, '.*');
+    const regex = new RegExp('^' + escaped + '$');
     return Array.from(this.store.keys()).filter(k => regex.test(k));
   }
 
@@ -189,6 +195,29 @@ class MemoryClient {
 
   async ping(): Promise<boolean> {
     return true;
+  }
+
+  constructor() {
+    this.startCleanup();
+  }
+
+  startCleanup(): void {
+    this.cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [key, entry] of this.store.entries()) {
+        if (entry.expiresAt && entry.expiresAt <= now) {
+          this.store.delete(key);
+        }
+      }
+    }, 60_000);
+    if (this.cleanupInterval.unref) this.cleanupInterval.unref();
+  }
+
+  stopCleanup(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
   }
 
   getSize(): number {
@@ -314,6 +343,12 @@ export class RedisCache {
 
   getMode(): string {
     return this.mode;
+  }
+
+  close(): void {
+    if (this.client instanceof MemoryClient) {
+      this.client.stopCleanup();
+    }
   }
 
   private updateHitRate(): void {

@@ -71,6 +71,7 @@ export function sharedContextOptions(): BrowserContextOptions {
     hasTouch: false,
     colorScheme: 'light',
     ignoreHTTPSErrors: true,
+    bypassCSP: true, // Allow WebSocket connections from injected scripts
     extraHTTPHeaders: {
       ...config.browser.headers,
     },
@@ -136,8 +137,22 @@ export function storageStatePath(accountId: string): string {
 
 export function loadStorageState(accountId: string): string | undefined {
   const p = storageStatePath(accountId);
-  if (fs.existsSync(p)) return p;
-  return undefined;
+  if (!fs.existsSync(p)) return undefined;
+
+  // Validate cookies are not all expired
+  try {
+    const state = JSON.parse(fs.readFileSync(p, 'utf8'));
+    const now = Math.floor(Date.now() / 1000);
+    const hasValidCookies = state.cookies?.some((c: any) => !c.expires || c.expires > now);
+    if (!hasValidCookies) {
+      console.log(`[Playwright] storageState for ${accountId} has expired cookies, will re-login`);
+      return undefined;
+    }
+  } catch {
+    // If we can't parse, let Playwright try and fail gracefully
+  }
+
+  return p;
 }
 
 export async function saveStorageState(ctx: BrowserContext, accountId: string): Promise<void> {
@@ -146,6 +161,23 @@ export async function saveStorageState(ctx: BrowserContext, accountId: string): 
     await ctx.storageState({ path: storageStatePath(accountId) });
   } catch (err: any) {
     console.warn(`[Playwright] Failed to save storageState for ${accountId}: ${err.message}`);
+  }
+}
+
+/**
+ * Check if a page is healthy and usable for browser fetch/stream.
+ * Returns true if the page is responsive and on the correct domain.
+ */
+export async function isPageHealthy(page: Page | null): Promise<boolean> {
+  if (!page || page.isClosed()) return false;
+  const url = page.url();
+  if (!url.includes('chat.qwen.ai')) return false;
+  // Verify CDP connection is alive
+  try {
+    await page.evaluate('1+1', { timeout: 3000 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -366,56 +398,61 @@ async function attemptAutoLogin(): Promise<void> {
 }
 
 export async function resetBrowserProfile(cacheKey: string, accountId?: string): Promise<void> {
-  const profileId = accountId === 'guest' ? '_guest' : (accountId || '_default');
-  const profilePath = path.join(PROFILES_DIR, profileId);
-
+  const release = await getUiMutex(cacheKey).acquire();
   try {
-    if (accountId === 'guest') {
-      await clearPageRuntimeState(guestPage);
-      if (guestContext) {
-        await guestContext.close();
-        guestContext = null;
+    const profileId = accountId === 'guest' ? '_guest' : (accountId || '_default');
+    const profilePath = path.join(PROFILES_DIR, profileId);
+
+    try {
+      if (accountId === 'guest') {
+        await clearPageRuntimeState(guestPage);
+        if (guestContext) {
+          await guestContext.close();
+          guestContext = null;
+        }
+        guestPage = null;
+      } else if (accountId) {
+        const acctPage = accountPages.get(accountId) ?? null;
+        await clearPageRuntimeState(acctPage);
+        const acctContext = accountContexts.get(accountId);
+        if (acctContext) {
+          await acctContext.close();
+          accountContexts.delete(accountId);
+        }
+        accountPages.delete(accountId);
+      } else {
+        await clearPageRuntimeState(activePage);
+        if (context) {
+          await context.close();
+          context = null;
+        }
+        activePage = null;
       }
-      guestPage = null;
-    } else if (accountId) {
-      const acctPage = accountPages.get(accountId) ?? null;
-      await clearPageRuntimeState(acctPage);
-      const acctContext = accountContexts.get(accountId);
-      if (acctContext) {
-        await acctContext.close();
-        accountContexts.delete(accountId);
+
+      if (browser?.isConnected()) {
+        await browser.close();
+        browser = null;
       }
-      accountPages.delete(accountId);
-    } else {
-      await clearPageRuntimeState(activePage);
-      if (context) {
-        await context.close();
-        context = null;
-      }
+
+      accountHeaderCaches.delete(cacheKey);
+      cookieCaches.delete(cacheKey);
+      cachedUserAgents.delete(cacheKey);
+      accountContexts.clear();
+      accountPages.clear();
+      context = null;
       activePage = null;
+      guestContext = null;
+      guestPage = null;
+      guestHeadersCache = null;
+      fs.rmSync(profilePath, { recursive: true, force: true });
+      fs.rmSync(storageStatePath(profileId), { force: true });
+
+      console.warn(`[Playwright] Cleared browser profile for ${cacheKey}: ${profilePath}`);
+    } catch (err: any) {
+      console.warn(`[Playwright] Failed to clear browser profile for ${cacheKey}: ${err.message}`);
     }
-
-    if (browser?.isConnected()) {
-      await browser.close();
-      browser = null;
-    }
-
-    accountHeaderCaches.delete(cacheKey);
-    cookieCaches.delete(cacheKey);
-    cachedUserAgents.delete(cacheKey);
-    accountContexts.clear();
-    accountPages.clear();
-    context = null;
-    activePage = null;
-    guestContext = null;
-    guestPage = null;
-    guestHeadersCache = null;
-    fs.rmSync(profilePath, { recursive: true, force: true });
-    fs.rmSync(storageStatePath(profileId), { force: true });
-
-    console.warn(`[Playwright] Cleared browser profile for ${cacheKey}: ${profilePath}`);
-  } catch (err: any) {
-    console.warn(`[Playwright] Failed to clear browser profile for ${cacheKey}: ${err.message}`);
+  } finally {
+    release();
   }
 }
 
@@ -526,46 +563,51 @@ export async function closePlaywright() {
 }
 
 export async function initPlaywrightForAccount(account: QwenAccount, _headless = true, browserType: BrowserType = 'chromium') {
-  const sharedBrowser = await getOrLaunchBrowser(browserType);
-
-  console.log(`[Playwright] Creating context for account ${account.email} on shared browser...`);
-
-  const storageState = loadStorageState(account.id);
-  const acctContext = await sharedBrowser.newContext({
-    ...sharedContextOptions(),
-    ...(storageState ? { storageState } : {}),
-  });
-
-  const acctPage = await acctContext.newPage();
-  accountContexts.set(account.id, acctContext);
-  accountPages.set(account.id, acctPage);
-
-  const hasAuth = await hasValidAuthCookie(acctPage);
-
-  if (!hasAuth && account.email && account.password) {
-    await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
-  }
-
+  const release = await getUiMutex(account.id).acquire();
   try {
-    await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
-    const url = acctPage.url();
-    if (url.includes('auth') || url.includes('login')) {
-      if (account.email && account.password) {
-        console.log(`[Playwright] Session expired for ${account.email}, re-logging in...`);
-        await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
-        await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
-      } else {
-        console.warn(`[Playwright] Session expired for account ${account.id} but no credentials available for re-login.`);
-      }
-    } else {
-      console.log(`[Playwright] Session validated for ${account.email}.`);
-    }
-  } catch (err: any) {
-    console.warn(`[Playwright] Failed to validate session for ${account.email}: ${err.message}`);
-  }
+    const sharedBrowser = await getOrLaunchBrowser(browserType);
 
-  if (await hasValidAuthCookie(acctPage)) {
-    await saveStorageState(acctContext, account.id);
+    console.log(`[Playwright] Creating context for account ${account.email} on shared browser...`);
+
+    const storageState = loadStorageState(account.id);
+    const acctContext = await sharedBrowser.newContext({
+      ...sharedContextOptions(),
+      ...(storageState ? { storageState } : {}),
+    });
+
+    const acctPage = await acctContext.newPage();
+    accountContexts.set(account.id, acctContext);
+    accountPages.set(account.id, acctPage);
+
+    const hasAuth = await hasValidAuthCookie(acctPage);
+
+    if (!hasAuth && account.email && account.password) {
+      await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+    }
+
+    try {
+      await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+      const url = acctPage.url();
+      if (url.includes('auth') || url.includes('login')) {
+        if (account.email && account.password) {
+          console.log(`[Playwright] Session expired for ${account.email}, re-logging in...`);
+          await loginToQwenWithContext(acctContext, acctPage, account.email, account.password);
+          await acctPage.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: config.timeouts.navigation });
+        } else {
+          console.warn(`[Playwright] Session expired for account ${account.id} but no credentials available for re-login.`);
+        }
+      } else {
+        console.log(`[Playwright] Session validated for ${account.email}.`);
+      }
+    } catch (err: any) {
+      console.warn(`[Playwright] Failed to validate session for ${account.email}: ${err.message}`);
+    }
+
+    if (await hasValidAuthCookie(acctPage)) {
+      await saveStorageState(acctContext, account.id);
+    }
+  } finally {
+    release();
   }
 }
 
