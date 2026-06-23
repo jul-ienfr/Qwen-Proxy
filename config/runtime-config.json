@@ -1,5 +1,9 @@
 {
   "timeouts.http": 45000,
   "cache.defaultTTL": 7200,
-  "fastStreamProxy": true
+  "fastStreamProxy": true,
+  "useWsBridge": false,
+  "directFetch": true,
+  "tlsH2Enabled": false,
+  "browser.headless": true
 }
