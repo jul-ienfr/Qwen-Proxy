@@ -228,7 +228,32 @@ export function robustParseJSON(str: string): any {
     aggressive = aggressive.replace(/,\s*([}\]])/g, '$1');
     const { result: aggFixed, openBraces: ob, openBrackets: bk, inString: aggInString } = sanitizeAndBalance(aggressive);
   try { return JSON.parse(closeBraces(aggFixed, ob, bk, aggInString)); } catch {
-    return null;
+    // Last resort: extract name and arguments via regex from malformed JSON
+    return extractFromMalformedJson(fixedJson);
   }
+}
+
+/**
+ * Extract tool name and arguments from severely malformed JSON
+ * when all other parsing strategies fail.
+ */
+function extractFromMalformedJson(str: string): any {
+  // Try to find "name" value
+  const nameMatch = str.match(/"name"\s*:\s*"([^"]+)"/);
+  if (!nameMatch) return null;
+  const name = nameMatch[1].trim();
+  if (!name || name.length > 100) return null;
+
+  // Try to find "arguments" value — it might be a JSON object or string
+  const argsMatch = str.match(/"arguments"\s*:\s*(\{[\s\S]*?\})\s*[,\}]/);
+  if (argsMatch) {
+    try {
+      const args = JSON.parse(argsMatch[1]);
+      return { name, arguments: args };
+    } catch { /* ignore */ }
+  }
+
+  // If no arguments found, return with empty args
+  return { name, arguments: {} };
 }
 }
