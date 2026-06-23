@@ -13,6 +13,10 @@ COPY src/ ./src/
 
 RUN npm run build && npm prune --omit=dev
 
+# Build webui (if exists)
+COPY webui/ ./webui/
+RUN cd webui && npm ci && npm run build || true
+
 RUN mkdir -p /app/data /app/qwen_profiles /tmp/playwright \
     && chown -R pwuser:pwuser /app /tmp/playwright
 

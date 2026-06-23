@@ -1,0 +1,81 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-950 text-gray-100;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-gray-900/50 backdrop-blur-sm border border-gray-800 rounded-xl p-6;
+  }
+
+  .btn-primary {
+    @apply bg-primary-600 hover:bg-primary-700 text-white font-medium py-2 px-4 rounded-lg transition-colors;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium py-2 px-4 rounded-lg transition-colors;
+  }
+
+  .input-field {
+    @apply bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-gray-100 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 px-4 py-3 rounded-lg text-gray-400 hover:text-gray-100 hover:bg-gray-800/50 transition-colors;
+  }
+
+  .nav-link-active {
+    @apply bg-primary-600/20 text-primary-400;
+  }
+}
+
+/* Markdown styles */
+.markdown-content pre {
+  @apply bg-gray-900 rounded-lg p-4 overflow-x-auto;
+}
+
+.markdown-content code {
+  @apply text-sm;
+}
+
+.markdown-content p {
+  @apply mb-4;
+}
+
+.markdown-content ul, .markdown-content ol {
+  @apply ml-6 mb-4 list-disc;
+}
+
+.markdown-content ol {
+  @apply list-decimal;
+}
+
+.markdown-content blockquote {
+  @apply border-l-4 border-gray-700 pl-4 italic text-gray-400;
+}
+
+.markdown-content a {
+  @apply text-primary-400 hover:underline;
+}
+
+.markdown-content table {
+  @apply w-full border-collapse mb-4;
+}
+
+.markdown-content th, .markdown-content td {
+  @apply border border-gray-700 px-4 py-2 text-left;
+}
+
+.markdown-content th {
+  @apply bg-gray-800;
+}
+
+/* Syntax highlighting */
+.hljs {
+  @apply bg-transparent;
+}
