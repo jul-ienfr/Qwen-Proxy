@@ -22,7 +22,7 @@ function cleanupCorruptedProfiles(): void {
       try {
         const filePath = path.join(profilesDir, file);
         const state = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-        const hasValidCookies = state.cookies?.some((c: any) => !c.expires || c.expires > now);
+        const hasValidCookies = state.cookies?.some((c: any) => c.expires < 0 || c.expires > now);
         if (!hasValidCookies) {
           fs.unlinkSync(filePath);
           cleaned++;

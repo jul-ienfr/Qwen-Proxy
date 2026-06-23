@@ -244,14 +244,43 @@ function extractFromMalformedJson(str: string): any {
   const name = nameMatch[1].trim();
   if (!name || name.length > 100) return null;
 
-  // Try to find "arguments" value — it might be a JSON object or string
-  const argsMatch = str.match(/"arguments"\s*:\s*(\{[\s\S]*?\})\s*[,\}]/);
-  if (argsMatch) {
-    try {
-      const args = JSON.parse(argsMatch[1]);
-      return { name, arguments: args };
-    } catch { /* ignore */ }
+  // Try to find "arguments" value using brace-balancing (not lazy regex)
+  const argsStart = str.indexOf('"arguments"');
+  if (argsStart === -1) return { name, arguments: {} };
+
+  // Find the opening brace after "arguments":
+  const colonIdx = str.indexOf(':', argsStart + '"arguments"'.length);
+  if (colonIdx === -1) return { name, arguments: {} };
+
+  let braceStart = -1;
+  for (let i = colonIdx + 1; i < str.length; i++) {
+    if (str[i] === '{') { braceStart = i; break; }
+    if (str[i] !== ' ' && str[i] !== '\t' && str[i] !== '\n' && str[i] !== '\r') break;
   }
+  if (braceStart === -1) return { name, arguments: {} };
+
+  // Balance braces to find the matching closing brace
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  let braceEnd = -1;
+  for (let i = braceStart; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inStr) { escape = true; continue; }
+    if (ch === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') { depth--; if (depth === 0) { braceEnd = i; break; } }
+  }
+
+  if (braceEnd === -1) return { name, arguments: {} };
+
+  const argsStr = str.slice(braceStart, braceEnd + 1);
+  try {
+    const args = JSON.parse(argsStr);
+    return { name, arguments: args };
+  } catch { /* ignore */ }
 
   // If no arguments found, return with empty args
   return { name, arguments: {} };

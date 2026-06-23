@@ -20,6 +20,11 @@ export class DashboardWindow {
     this.windowState = loadWindowState()
   }
 
+  /** Update stored window dimensions (call before close to persist actual size) */
+  updateState(state: Partial<WindowState>): void {
+    Object.assign(this.windowState, state)
+  }
+
   async open(): Promise<void> {
     if (this.window) {
       // La fenêtre existe déjà, la focaliser
@@ -37,6 +42,12 @@ export class DashboardWindow {
 
   private async openNew(): Promise<void> {
     try {
+      // Destroy any leaked hidden window before creating a new one
+      if (this.window) {
+        try { await (this.window as any).close?.() ?? this.window.hide() } catch { /* ignore */ }
+        this.window = null
+      }
+
       // Étendre le tray avec la capacité webview via TrayHandle.extend()
       const extendedTray = this.tray!.extend(WebviewExt)
 
@@ -77,7 +88,7 @@ export class DashboardWindow {
   async close(): Promise<void> {
     if (this.window) {
       try {
-        await this.window.hide()
+        await (this.window as any).close?.() ?? await this.window.hide()
       } catch {
         // Ignorer les erreurs de fermeture
       }

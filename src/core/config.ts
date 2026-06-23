@@ -3,11 +3,14 @@
  *
  * The `config` export is the same object reference throughout the lifecycle.
  * Properties are mutated in place, so all existing imports work dynamically.
+ *
+ * IMPORTANT: Uses getConfigManager() singleton to ensure all modules share
+ * the same ConfigManager instance (avoids dual-singleton split).
  */
 
-import { ConfigManager } from './config-manager.js'
+import { getConfigManager } from './config-manager.js'
 
-const manager = new ConfigManager()
+const manager = getConfigManager()
 
 /** The mutable config object — all existing imports read from this */
 export const config = manager.config

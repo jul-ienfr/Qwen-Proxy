@@ -5,6 +5,7 @@ const HEADER_REFRESH_MARGIN_MS = 60 * 1000; // Refresh headers 1 min before they
 const HEADERS_TTL_MS = 5 * 60 * 1000;
 
 let warmerTimer: ReturnType<typeof setInterval> | null = null;
+let initialDelayTimer: ReturnType<typeof setTimeout> | null = null;
 let lastHeaderRefresh: Map<string, number> = new Map();
 
 function log(msg: string) {
@@ -151,7 +152,8 @@ export function startStreamWarmer(): void {
   };
 
   // Run the first tick after a short delay (let server finish starting)
-  setTimeout(() => {
+  initialDelayTimer = setTimeout(() => {
+    initialDelayTimer = null;
     runTick().catch(() => {});
   }, 30_000);
 
@@ -166,6 +168,10 @@ export function startStreamWarmer(): void {
  * Stop the stream warmer (for graceful shutdown).
  */
 export function stopStreamWarmer(): void {
+  if (initialDelayTimer) {
+    clearTimeout(initialDelayTimer);
+    initialDelayTimer = null;
+  }
   if (warmerTimer) {
     clearInterval(warmerTimer);
     warmerTimer = null;

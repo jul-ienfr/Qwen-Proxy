@@ -134,11 +134,11 @@ export class TrayManager {
   async updateServerState(running: boolean): Promise<void> {
     this.serverRunning = running
 
-    if (!this.broker || !this.tray) return
+    if (!this.broker || !this.tray || !this.space) return
 
     try {
       const icon = running ? getRunningIcon() : getStoppedIcon()
-      const spaceId = this.space!.space.spaceId
+      const spaceId = this.space.space.spaceId
       const trayId = this.tray.trayId
 
       // Mettre à jour l'icône via le transport

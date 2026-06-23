@@ -16,6 +16,9 @@ import { requestLogger } from '../core/request-logger.js'
 import { requestStore } from '../core/request-store.js'
 import { getAllCircuitBreakerStats } from '../core/circuit-breaker.js'
 import { anthropicMessages, geminiGenerateContent } from '../routes/multi-protocol.js'
+import { imageGenerations, imageEdits } from '../routes/images.js'
+import { videoGenerations } from '../routes/videos.js'
+import { proxyAdminApp } from '../routes/proxy-admin.js'
 import { app as debugApp } from '../routes/debug.js'
 import { app as serverConfigApp } from '../routes/server-config.js'
 import { sessionsApp } from '../routes/sessions.js'
@@ -78,6 +81,13 @@ app.post('/v1/chat/completions', chatCompletions)
 app.post('/v1/chat/completions/stop', chatCompletionsStop)
 app.post('/v1/upload', uploadFile)
 
+// Image generation endpoints
+app.post('/v1/images/generations', imageGenerations)
+app.post('/v1/images/edits', imageEdits)
+
+// Video generation endpoint
+app.post('/v1/videos', videoGenerations)
+
 // Anthropic endpoints
 app.post('/v1/messages', anthropicMessages)
 app.post('/anthropic/v1/messages', anthropicMessages)
@@ -91,6 +101,9 @@ app.post('/v1/models/:model/streamGenerateContent', geminiGenerateContent)
 // Config & History
 app.route('', configApp)
 app.route('', historyApp)
+
+// Proxy admin (under /v1 for auth middleware coverage)
+app.route('/v1', proxyAdminApp)
 
 // Debug mode
 app.route('', debugApp)
@@ -149,6 +162,12 @@ app.get('/health', async (c) => {
       } catch {
         return {};
       }
+    })(),
+    proxyPool: await (async () => {
+      try {
+        const { getProxyPool } = await import('../services/proxy-pool.js')
+        return getProxyPool().getStats()
+      } catch { return { total: 0, available: 0, failed: 0, untested: 0 } }
     })(),
     wsBridge: await (async () => {
       try {
@@ -409,6 +428,14 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
   }
 
   metrics.startCollection()
+
+  // Initialize proxy pool
+  try {
+    const { initProxyPool } = await import('../services/proxy-pool.js')
+    initProxyPool()
+  } catch (err: any) {
+    console.warn('[Server] Proxy pool init failed:', err.message)
+  }
 
   server = serve({
     fetch: app.fetch,

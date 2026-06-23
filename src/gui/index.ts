@@ -32,12 +32,11 @@ export class GuiManager {
         const newHeadless = !config.browser.headless
         console.log(`[GUI] Toggling browser visibility: headless ${config.browser.headless} → ${newHeadless}`)
         configManager.updateConfig('browser.headless', newHeadless)
-        // Refresh tray menu to reflect new state
-        this.tray?.updateServerState(this.serverRunning)
+        // Tray refresh is handled by the config:change listener below
       },
       onQuit: () => {
         console.log('[GUI] Quit requested')
-        this.shutdown().then(() => process.exit(0))
+        this.shutdown().then(() => process.exit(0)).catch(() => process.exit(1))
       },
     })
 

@@ -228,7 +228,11 @@ export async function getOrLaunchBrowser(_browserType: BrowserType = 'chromium')
     humanize: true,
     args: getBrowserLaunchArgs(),
   });
-  browser.on('disconnected', () => { browser = null; });
+  browser.on('disconnected', () => {
+    browser = null;
+    context = null;
+    activePage = null;
+  });
   return browser;
 }
 
