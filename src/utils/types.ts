@@ -54,6 +54,12 @@ export interface OpenAIRequest {
   stream_options?: {
     include_usage?: boolean;
   };
+  /** Enable/disable thinking mode */
+  thinking?: boolean;
+  /** Thinking effort level (e.g. 'low', 'medium', 'high', 'Thinking') */
+  thinking_effort?: string;
+  /** Whether parallel tool calls are allowed (default true) */
+  parallel_tool_calls?: boolean;
 }
 
 // --- Response Types ---

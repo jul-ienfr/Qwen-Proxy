@@ -230,8 +230,10 @@ function handleChatDone(client: ClientState, msg: SignalingMessage): void {
 
 // ─── Header Refresh Cycle ────────────────────────────────────────────────────
 
+let headerRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
 function startHeaderRefreshCycle(): void {
-  setInterval(async () => {
+  headerRefreshTimer = setInterval(async () => {
     const now = Date.now();
 
     for (const [, client] of clients) {
@@ -263,20 +265,33 @@ function startHeaderRefreshCycle(): void {
       }
     }
   }, 30000); // Check every 30s
+  if (headerRefreshTimer.unref) headerRefreshTimer.unref();
 }
 
 // ─── Heartbeat Check ─────────────────────────────────────────────────────────
 
-setInterval(() => {
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+export function stopWsTimers(): void {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  if (headerRefreshTimer) { clearInterval(headerRefreshTimer); headerRefreshTimer = null; }
+}
+
+heartbeatTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, client] of clients) {
     if (now - client.lastHeartbeat > HEARTBEAT_TIMEOUT_MS) {
       console.log(`[WSSignaling] Client ${id} timed out (no heartbeat)`);
+      // Release any warm chats held by this client before closing
+      for (const chatId of client.activeChats) {
+        releaseWarmChat(client.accountId || '', chatId);
+      }
       client.ws.close();
       clients.delete(id);
     }
   }
 }, 30000);
+if (heartbeatTimer.unref) heartbeatTimer.unref();
 
 // ─── Utilities ───────────────────────────────────────────────────────────────
 

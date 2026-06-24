@@ -17,11 +17,29 @@ const streamCallbacks = new Map<string, {
   onError: (msg: string) => void;
   onMeta: (meta: { status: number; statusText: string; contentType: string; headers: Record<string, string> }) => void;
   onBody: (body: string) => void;
+  createdAt: number;
 }>();
 
 const chunkCounts = new Map<string, number>();
 
 const abortControllers = new Map<string, () => void>();
+
+// Periodic cleanup of abandoned stream entries to prevent memory leaks.
+// Removes entries older than 10 minutes every 60 seconds.
+const STALE_THRESHOLD_MS = 10 * 60 * 1000;
+const CLEANUP_INTERVAL_MS = 60 * 1000;
+
+const _streamCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [reqId, entry] of streamCallbacks) {
+    if (now - entry.createdAt > STALE_THRESHOLD_MS) {
+      streamCallbacks.delete(reqId);
+      chunkCounts.delete(reqId);
+      abortControllers.delete(reqId);
+    }
+  }
+}, CLEANUP_INTERVAL_MS);
+_streamCleanupInterval.unref();
 
 // Store relay callback per page so we can re-inject after navigation
 const relayCallbacks = new WeakMap<Page, (reqId: string, type: string, data: any) => void>();
@@ -193,6 +211,7 @@ export async function browserStreamFetch(
       metaReject(new Error(msg));
     },
     onBody: () => {},
+    createdAt: Date.now(),
   });
 
   let bodyResolve!: (value: string) => void;

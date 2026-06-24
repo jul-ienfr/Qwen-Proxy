@@ -1,5 +1,7 @@
 import { Hono } from 'hono'
-import { serve } from '@hono/node-server'
+import type { Context } from 'hono'
+import { serve, type ServerType } from '@hono/node-server'
+import type { Server } from 'node:http'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
@@ -29,7 +31,7 @@ import { registerConfigHandlers } from '../core/config-handlers.js'
 import { RateLimiter } from '../middleware/rate-limiter.js'
 import { loadAccounts } from '../core/accounts.js'
 import { getAccountCooldownInfo } from '../core/account-manager.js'
-import { getBrowser } from '../services/browser-manager.js'
+import { getBrowser, type BrowserType } from '../services/browser-manager.js'
 import { getPredictionCacheStats } from '../cache/prediction-cache.js'
 import { getWarmPoolStats } from '../services/warm-pool.js'
 import { getSessionManager } from '../core/session-manager.js'
@@ -37,7 +39,7 @@ import { getSessionManager } from '../core/session-manager.js'
 const app = new Hono()
 
 let watchdog: Watchdog
-let server: any
+let server: ServerType | null = null
 
 app.use('/v1/*', async (c, next) => {
   metrics.increment('requests.total')
@@ -118,6 +120,19 @@ app.route('', serverConfigApp)
 // Account cooldown management
 app.route('/v1', accountsApp)
 
+// ─── Cached lazy imports for health endpoint (avoid dynamic import per request) ──
+let _tlsPoolGetStats: (() => unknown) | null = null;
+let _proxyPoolGetStats: (() => unknown) | null = null;
+let _wsBridgeGetStats: (() => unknown) | null = null;
+let _signalingGetStats: (() => unknown) | null = null;
+
+async function initHealthImports(): Promise<void> {
+  try { const m = await import('../services/tls-pool.js'); _tlsPoolGetStats = m.getPoolStats; } catch { /* optional module */ }
+  try { const m = await import('../services/proxy-pool.js'); _proxyPoolGetStats = () => m.getProxyPool().getStats(); } catch { /* optional module */ }
+  try { const m = await import('../services/stream-ws-bridge.js'); _wsBridgeGetStats = m.getWSBridgeStats; } catch { /* optional module */ }
+  try { const m = await import('../api/ws-server.js'); _signalingGetStats = m.getSignalingStats; } catch { /* optional module */ }
+}
+
 app.get('/health', async (c) => {
   const accounts = loadAccounts()
   const browser = getBrowser()
@@ -154,12 +169,7 @@ app.get('/health', async (c) => {
       bufferSize: requestLogger.getBufferSize(),
     },
     circuitBreakers: getAllCircuitBreakerStats(),
-    tlsPool: await (async () => {
-      try {
-        const { getPoolStats } = await import('../services/tls-pool.js')
-        return getPoolStats()
-      } catch { return { total: 0, alive: 0, totalRequests: 0 } }
-    })(),
+    tlsPool: _tlsPoolGetStats ? _tlsPoolGetStats() : { total: 0, alive: 0, totalRequests: 0 },
     warmPool: (() => {
       try {
         return getWarmPoolStats();
@@ -167,18 +177,8 @@ app.get('/health', async (c) => {
         return {};
       }
     })(),
-    proxyPool: await (async () => {
-      try {
-        const { getProxyPool } = await import('../services/proxy-pool.js')
-        return getProxyPool().getStats()
-      } catch { return { total: 0, available: 0, failed: 0, untested: 0 } }
-    })(),
-    wsBridge: await (async () => {
-      try {
-        const { getWSBridgeStats } = await import('../services/stream-ws-bridge.js')
-        return getWSBridgeStats()
-      } catch { return { serverRunning: false, port: 0, activeConnections: 0 } }
-    })(),
+    proxyPool: _proxyPoolGetStats ? _proxyPoolGetStats() : { total: 0, available: 0, failed: 0, untested: 0 },
+    wsBridge: _wsBridgeGetStats ? _wsBridgeGetStats() : { serverRunning: false, port: 0, activeConnections: 0 },
     sessions: (() => {
       try {
         const sessionMgr = getSessionManager();
@@ -187,12 +187,7 @@ app.get('/health', async (c) => {
         return { active: 0, sessions: [] };
       }
     })(),
-    signaling: await (async () => {
-      try {
-        const { getSignalingStats } = await import('../api/ws-server.js')
-        return getSignalingStats()
-      } catch { return { connectedClients: 0, authenticatedClients: 0, activeChats: 0 } }
-    })(),
+    signaling: _signalingGetStats ? _signalingGetStats() : { connectedClients: 0, authenticatedClients: 0, activeChats: 0 },
     debug: {
       enabled: getDebugState().isEnabled(),
       bufferUsed: getDebugLogger().getStats().total,
@@ -215,8 +210,8 @@ app.get('/v1/performance', async (c) => {
   const { getPerformanceStats, getCurrentPath } = await import('../services/performance-monitor.js')
   const { getPoolStats } = await import('../services/tls-pool.js')
 
-  let wsBridge: any = { status: 'unknown', port: 0, activeConnections: 0 }
-  let signaling: any = { connectedClients: 0, authenticatedClients: 0, activeChats: 0 }
+  let wsBridge: { status: string; port: number; activeConnections: number } = { status: 'unknown', port: 0, activeConnections: 0 }
+  let signaling: { connectedClients: number; authenticatedClients: number; activeChats: number } = { connectedClients: 0, authenticatedClients: 0, activeChats: 0 }
   try {
     const { getSignalingStats } = await import('../api/ws-server.js')
     const sigStats = getSignalingStats()
@@ -244,6 +239,23 @@ app.get('/v1/performance', async (c) => {
   })
 })
 
+// ─── Captcha Stats Endpoint ────────────────────────────────────────────────
+app.get('/v1/captcha/stats', async (c) => {
+  const { getCaptchaStats, getSolverConfig } = await import('../services/captcha-solver.js');
+  return c.json({ ...getCaptchaStats(), config: getSolverConfig() });
+})
+
+app.put('/v1/captcha/config', async (c) => {
+  const { configureSolver } = await import('../services/captcha-solver.js');
+  try {
+    const body = await c.req.json();
+    configureSolver(body);
+    return c.json({ ok: true, config: (await import('../services/captcha-solver.js')).getSolverConfig() });
+  } catch (err: unknown) {
+    return c.json({ error: err instanceof Error ? err.message : 'Unknown error' }, 400);
+  }
+})
+
 // ─── Config Toggle API ──────────────────────────────────────────────────────
 const CONFIG_HOT_RELOAD: Record<string, boolean> = {
   fastStreamProxy: true,
@@ -267,8 +279,8 @@ app.put('/v1/config/:key', async (c) => {
     configManager.updateConfig(key, value);
     console.log(`[Config] ${key}: ${oldValue} → ${value}`);
     return c.json({ key, oldValue, newValue: value, hotReloaded: CONFIG_HOT_RELOAD[key], persisted: true });
-  } catch (e: any) {
-    return c.json({ error: e.message }, 400);
+  } catch (e: unknown) {
+    return c.json({ error: e instanceof Error ? e.message : 'Unknown error' }, 400);
   }
 });
 
@@ -299,7 +311,7 @@ const WEBUI_DIR = fs.existsSync(WEBUI_DIST) ? WEBUI_DIST : WEBUI_LEGACY;
 const webuiExists = fs.existsSync(WEBUI_DIR);
 
 // Helper to serve static files
-async function serveWebuiFile(c: any, filePath: string): Promise<Response | null> {
+async function serveWebuiFile(c: Context, filePath: string): Promise<Response | null> {
   const fullPath = path.join(WEBUI_DIR, filePath);
   try {
     const content = await fs.promises.readFile(fullPath);
@@ -380,12 +392,15 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
 
   await cache.connect()
 
+  // Pre-cache dynamic imports for health endpoint (avoid import per request)
+  initHealthImports().catch(() => {})
+
   const accounts = loadAccounts()
 
   const { initPlaywright, initPlaywrightForAccount } = await import('../services/playwright.js')
-  const { getProfilesDir } = await import('../services/browser-manager.js')
+  await import('../services/browser-manager.js')
 
-  await initPlaywright(config.browser.headless, config.browser.type as any)
+  await initPlaywright(config.browser.headless, config.browser.type as BrowserType)
   
   if (accounts.length > 0) {
     const { getAccountCredentials } = await import('../core/accounts.js')
@@ -399,8 +414,8 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
         if (!creds) continue
         const staggerMs = 500 + Math.floor(Math.random() * 1500);
         await new Promise(r => setTimeout(r, staggerMs));
-        await initPlaywrightForAccount(creds, config.browser.headless, config.browser.type as any).catch((err: any) => {
-          console.error(`[Server] Failed to initialize account ${account.email}:`, err.message)
+        await initPlaywrightForAccount(creds, config.browser.headless, config.browser.type as BrowserType).catch((err: unknown) => {
+          console.error(`[Server] Failed to initialize account ${account.email}:`, err instanceof Error ? err.message : err)
         })
       }
     }
@@ -413,16 +428,16 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
       const { startStreamWarmer } = await import('../services/stream-warmer.js')
       startStreamWarmer()
       console.log('[Server] Stream warmer started')
-    } catch (err: any) {
-      console.warn('[Server] Stream warmer init failed:', err.message)
+    } catch (err: unknown) {
+      console.warn('[Server] Stream warmer init failed:', err instanceof Error ? err.message : err)
     }
 
     // Start session keep-alive (prevents captcha after inactivity)
     try {
       const { startSessionKeeper } = await import('../services/session-keeper.js')
       startSessionKeeper()
-    } catch (err: any) {
-      console.warn('[Server] Session keeper init failed:', err.message)
+    } catch (err: unknown) {
+      console.warn('[Server] Session keeper init failed:', err instanceof Error ? err.message : err)
     }
   }
 
@@ -434,8 +449,8 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
     const { initTLSPool } = await import('../services/tls-pool.js')
     await initTLSPool()
     console.log('[Server] TLS connection pool initialized')
-  } catch (err: any) {
-    console.warn('[Server] TLS pool init failed (using standard fetch):', err.message)
+  } catch (err: unknown) {
+    console.warn('[Server] TLS pool init failed (using standard fetch):', err instanceof Error ? err.message : err)
   }
 
   metrics.startCollection()
@@ -444,8 +459,8 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
   try {
     const { initProxyPool } = await import('../services/proxy-pool.js')
     initProxyPool()
-  } catch (err: any) {
-    console.warn('[Server] Proxy pool init failed:', err.message)
+  } catch (err: unknown) {
+    console.warn('[Server] Proxy pool init failed:', err instanceof Error ? err.message : err)
   }
 
   server = serve({
@@ -461,10 +476,10 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
     // Initialize WebSocket signaling server for Browser-Direct mode
     try {
       const wsServer = await import('../api/ws-server.js')
-      wsServer.initSignalingServer(server)
+      wsServer.initSignalingServer(server as Server)
       console.log('[Server] WebSocket signaling server initialized')
-    } catch (err: any) {
-      console.warn('[Server] WebSocket signaling init failed:', err.message)
+    } catch (err: unknown) {
+      console.warn('[Server] WebSocket signaling init failed:', err instanceof Error ? err.message : err)
     }
   })
 
@@ -488,6 +503,16 @@ export async function startServer(onReady?: (port: number) => void): Promise<voi
       try {
         const { stopSessionKeeper } = await import('../services/session-keeper.js')
         stopSessionKeeper()
+      } catch { /* ignore */ }
+      // Stop warm pool cleanup timer
+      try {
+        const { stopCleanup } = await import('../services/warm-pool.js')
+        stopCleanup()
+      } catch { /* ignore */ }
+      // Stop ws-server heartbeat/header timers
+      try {
+        const { stopWsTimers } = await import('../api/ws-server.js')
+        stopWsTimers()
       } catch { /* ignore */ }
       watchdog.stop()
       metrics.stopCollection()

@@ -4,16 +4,22 @@
  */
 
 import type { Context } from 'hono';
-import { stream as honoStream } from 'hono/streaming';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import crypto from 'crypto';
 import { getQwenHeaders } from '../services/playwright.js';
 import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, getAccountCooldownInfo } from '../core/account-manager.js';
-import { loadAccounts } from '../core/accounts.js';
-import { metrics } from '../core/metrics.js';
 import { requestLogger } from '../core/request-logger.js';
 import { getDebugLogger } from '../core/debug-logger.js';
+import { readSseStreamForUrl } from '../utils/media-helpers.js';
 
 const CACHED_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+
+interface UpstreamError {
+  status?: number;
+  code?: string;
+  message?: string;
+  error?: string;
+}
 
 // ─── Size Mapping (OpenAI format → Qwen format) ──────────────────────────────
 
@@ -28,133 +34,6 @@ const SIZE_MAP: Record<string, string> = {
 function normalizeSize(size?: string): string {
   if (!size) return '1:1';
   return SIZE_MAP[size] || size;
-}
-
-// ─── SSE Parsing Helpers ──────────────────────────────────────────────────────
-
-function parseSsePayloads(buffer: string, flush = false): { payloads: string[]; buffer: string } {
-  const input = flush ? `${buffer}\n\n` : buffer;
-  const events = input.split(/\r?\n\r?\n/);
-  const payloads: string[] = [];
-  const remainBuffer = flush ? '' : (events.pop() || '');
-
-  for (const event of events) {
-    const dataLines = event
-      .split(/\r?\n/)
-      .filter(item => item.trim().startsWith('data:'))
-      .map(item => item.replace(/^data:\s*/, '').trim())
-      .filter(Boolean);
-
-    if (dataLines.length === 0) continue;
-
-    const payload = dataLines.join('\n').trim();
-    if (payload && payload !== '[DONE]') {
-      payloads.push(payload);
-    }
-  }
-
-  return { payloads, buffer: remainBuffer };
-}
-
-function extractResourceUrlFromText(text: string): string | null {
-  if (!text) return null;
-
-  // Markdown image: ![alt](url)
-  const markdownUrl = text.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i)?.[1];
-  if (markdownUrl) return markdownUrl;
-
-  // Download link: [Download ...](url)
-  const downloadUrl = text.match(/\[Download [^\]]+\]\((https?:\/\/[^\s)]+)\)/i)?.[1];
-  if (downloadUrl) return downloadUrl;
-
-  // Plain URL
-  const plainUrl = text.match(/https?:\/\/[^\s<>"')\]]+/i)?.[0];
-  return plainUrl || null;
-}
-
-function extractResourceUrlFromPayload(payload: any): string | null {
-  if (!payload) return null;
-
-  if (Array.isArray(payload)) {
-    for (const item of payload) {
-      const url = extractResourceUrlFromPayload(item);
-      if (url) return url;
-    }
-    return null;
-  }
-
-  if (typeof payload === 'string') {
-    const trimmed = payload.trim();
-    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        const url = extractResourceUrlFromPayload(parsed);
-        if (url) return url;
-      } catch { /* ignore */ }
-    }
-    return extractResourceUrlFromText(trimmed);
-  }
-
-  if (typeof payload !== 'object') return null;
-
-  // Direct candidates
-  const directCandidates = [
-    payload.content, payload.url, payload.image, payload.image_url,
-    payload.video, payload.video_url, payload.download_url, payload.file_url,
-    payload.resource_url, payload.output_url, payload.result_url, payload.uri,
-  ];
-
-  for (const candidate of directCandidates) {
-    if (typeof candidate === 'string') {
-      const url = extractResourceUrlFromText(candidate);
-      if (url) return url;
-    }
-    if (candidate && typeof candidate === 'object') {
-      const url = extractResourceUrlFromPayload(candidate);
-      if (url) return url;
-    }
-  }
-
-  // Nested candidates
-  const nestedCandidates = [
-    payload.data, payload.message, payload.delta, payload.extra,
-    payload.choices, payload.output, payload.result, payload.results,
-  ];
-
-  for (const candidate of nestedCandidates) {
-    const url = extractResourceUrlFromPayload(candidate);
-    if (url) return url;
-  }
-
-  return null;
-}
-
-function parseUpstreamError(data: any): { error: string; code: string; status: number } | null {
-  try {
-    let payload = data;
-    if (Array.isArray(payload) && payload.length > 0) payload = payload[0];
-    if (typeof payload === 'string') payload = JSON.parse(payload);
-
-    if (!payload || payload.success !== false || !payload.data?.code) return null;
-
-    const errorData = payload.data;
-    if (errorData.code === 'RateLimited') {
-      const waitHours = errorData.num;
-      return {
-        error: `Rate limited. ${waitHours ? `Please wait ~${waitHours} hours.` : 'Please try again later.'}`,
-        code: errorData.code,
-        status: 429,
-      };
-    }
-
-    return {
-      error: errorData.details || errorData.code || 'Upstream error',
-      code: errorData.code,
-      status: 500,
-    };
-  } catch {
-    return null;
-  }
 }
 
 // ─── Image Generation: POST /v1/images/generations ────────────────────────────
@@ -192,7 +71,7 @@ export async function imageGenerations(c: Context) {
     // Get account and headers
     let account = getNextAccount();
     const triedAccountIds = new Set<string>();
-    let lastError: any = null;
+    let lastError: UpstreamError | null = null;
 
     while (account) {
       if (triedAccountIds.has(account.id)) {
@@ -217,13 +96,18 @@ export async function imageGenerations(c: Context) {
         });
 
         // Format response (OpenAI-compatible)
-        const data = result.data.map((item: any) => {
+        const data = await Promise.all(result.data.map(async (item: { url: string }) => {
           if (response_format === 'b64_json' && item.url) {
-            // TODO: download and convert to base64
-            return { url: item.url };
+            try {
+              const resp = await fetch(item.url, { signal: AbortSignal.timeout(30_000) });
+              if (resp.ok) {
+                const buffer = Buffer.from(await resp.arrayBuffer());
+                return { b64_json: buffer.toString('base64') };
+              }
+            } catch { /* fall through to url */ }
           }
           return { url: item.url };
-        });
+        }));
 
         const response = {
           created: Math.floor(Date.now() / 1000),
@@ -253,26 +137,28 @@ export async function imageGenerations(c: Context) {
         });
 
         return c.json(response);
-      } catch (err: any) {
-        if (err.status === 429 || err.code === 'RateLimited') {
-          const hourHint = err.message?.match?.(/Wait about (\d+) hour/);
+      } catch (err: unknown) {
+        const e = err as UpstreamError;
+        if (e.status === 429 || e.code === 'RateLimited') {
+          const hourHint = e.message?.match?.(/Wait about (\d+) hour/);
           const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
           markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
         }
-        lastError = err;
+        lastError = e;
         account = getNextAvailableAccount(triedAccountIds);
       }
     }
 
     throw lastError || new Error('All accounts failed');
-  } catch (err: any) {
-    const status = err.status || 500;
+  } catch (err: unknown) {
+    const e = err as UpstreamError;
+    const status = e.status || 500;
     return c.json({
       error: {
-        message: err.error || err.message || 'Image generation failed',
+        message: e.error || e.message || 'Image generation failed',
         type: status >= 500 ? 'server_error' : 'invalid_request_error',
       },
-    }, status as any);
+    }, status as ContentfulStatusCode);
   }
 }
 
@@ -299,7 +185,7 @@ export async function imageEdits(c: Context) {
     // Get account
     let account = getNextAccount();
     const triedAccountIds = new Set<string>();
-    let lastError: any = null;
+    let lastError: UpstreamError | null = null;
 
     while (account) {
       if (triedAccountIds.has(account.id)) {
@@ -356,26 +242,28 @@ export async function imageEdits(c: Context) {
         });
 
         return c.json(response);
-      } catch (err: any) {
-        if (err.status === 429 || err.code === 'RateLimited') {
-          const hourHint = err.message?.match?.(/Wait about (\d+) hour/);
+      } catch (err: unknown) {
+        const e = err as UpstreamError;
+        if (e.status === 429 || e.code === 'RateLimited') {
+          const hourHint = e.message?.match?.(/Wait about (\d+) hour/);
           const cooldownMs = hourHint ? parseInt(hourHint[1]) * 60 * 60 * 1000 : undefined;
           markAccountRateLimited(account.id, cooldownMs, 'RateLimited');
         }
-        lastError = err;
+        lastError = e;
         account = getNextAvailableAccount(triedAccountIds);
       }
     }
 
     throw lastError || new Error('All accounts failed');
-  } catch (err: any) {
-    const status = err.status || 500;
+  } catch (err: unknown) {
+    const e = err as UpstreamError;
+    const status = e.status || 500;
     return c.json({
       error: {
-        message: err.error || err.message || 'Image edit failed',
+        message: e.error || e.message || 'Image edit failed',
         type: status >= 500 ? 'server_error' : 'invalid_request_error',
       },
-    }, status as any);
+    }, status as ContentfulStatusCode);
   }
 }
 
@@ -401,7 +289,7 @@ interface ImageGenOptions {
 }
 
 async function generateImage(options: ImageGenOptions): Promise<{ data: Array<{ url: string }> }> {
-  const { prompt, model, size, n, accountId } = options;
+  const { prompt, model, size: _size, n: _n, accountId } = options;
 
   // Get headers for this account
   const { headers: qHeaders } = await getQwenHeaders(false, accountId);
@@ -461,42 +349,7 @@ async function generateImage(options: ImageGenOptions): Promise<{ data: Array<{ 
   }
 
   // Parse SSE response
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let contentUrl: string | null = null;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const { payloads, buffer: newBuffer } = parseSsePayloads(buffer);
-    buffer = newBuffer;
-
-    for (const payload of payloads) {
-      try {
-        const parsed = JSON.parse(payload);
-        const error = parseUpstreamError(parsed);
-        if (error) throw error;
-
-        const url = extractResourceUrlFromPayload(parsed);
-        if (url && !contentUrl) contentUrl = url;
-      } catch (err: any) {
-        if (err.status) throw err;
-      }
-    }
-  }
-
-  // Flush remaining
-  const { payloads } = parseSsePayloads(buffer, true);
-  for (const payload of payloads) {
-    try {
-      const parsed = JSON.parse(payload);
-      const url = extractResourceUrlFromPayload(parsed);
-      if (url && !contentUrl) contentUrl = url;
-    } catch { /* ignore */ }
-  }
+  const { contentUrl } = await readSseStreamForUrl(response.body!);
 
   if (!contentUrl) throw { status: 502, error: 'Upstream did not return an image URL' };
 
@@ -505,7 +358,7 @@ async function generateImage(options: ImageGenOptions): Promise<{ data: Array<{ 
 
 async function generateImageEdit(options: ImageGenOptions & { imageUrl: string }): Promise<{ data: Array<{ url: string }> }> {
   // Similar to generateImage but with image_edit chat_type
-  const { prompt, model, size, n, accountId, imageUrl } = options;
+  const { prompt, model, size: _size, n: _n, accountId, imageUrl } = options;
 
   const { headers: qHeaders } = await getQwenHeaders(false, accountId);
   const chatId = await createImageChat(model, qHeaders, accountId, 'image_edit');
@@ -581,38 +434,7 @@ async function generateImageEdit(options: ImageGenOptions & { imageUrl: string }
   }
 
   // Parse SSE response (same as generateImage)
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let contentUrl: string | null = null;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const { payloads, buffer: newBuffer } = parseSsePayloads(buffer);
-    buffer = newBuffer;
-    for (const payload of payloads) {
-      try {
-        const parsed = JSON.parse(payload);
-        const error = parseUpstreamError(parsed);
-        if (error) throw error;
-        const url = extractResourceUrlFromPayload(parsed);
-        if (url && !contentUrl) contentUrl = url;
-      } catch (err: any) {
-        if (err.status) throw err;
-      }
-    }
-  }
-
-  const { payloads } = parseSsePayloads(buffer, true);
-  for (const payload of payloads) {
-    try {
-      const parsed = JSON.parse(payload);
-      const url = extractResourceUrlFromPayload(parsed);
-      if (url && !contentUrl) contentUrl = url;
-    } catch { /* ignore */ }
-  }
+  const { contentUrl } = await readSseStreamForUrl(response.body!);
 
   if (!contentUrl) throw { status: 502, error: 'Upstream did not return an edited image URL' };
 

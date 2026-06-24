@@ -27,4 +27,4 @@ export {
 } from './stream-bridge.js';
 
 export { getStealthScript } from './stealth.js';
-export { solveBaxiaCaptcha, startCaptchaWatcher } from './captcha-solver.js';
+export { solveBaxiaCaptcha, startCaptchaWatcher, captchaSolver, waitForSolved, getCaptchaStats, configureSolver, getSolverConfig } from './captcha-solver.js';

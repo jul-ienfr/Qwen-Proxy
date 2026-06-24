@@ -3,8 +3,39 @@ import { config } from '../core/config.js'
 import { getBasicHeaders } from '../services/playwright.js'
 import { loadAccounts } from '../core/accounts.js'
 import { getAccountCooldownInfo } from '../core/account-manager.js'
-import { cache } from '../cache/memory-cache.js'
+import { cache, type CacheKey } from '../cache/memory-cache.js'
 import { syncModelContextWindows } from '../core/model-registry.js'
+
+/** Raw model item as returned by the Qwen /api/models endpoint */
+interface QwenApiModel {
+  id: string
+  name: string
+  owned_by: string
+  info?: {
+    created_at?: number
+    meta?: {
+      max_context_length?: number
+      capabilities?: string[]
+    }
+  }
+}
+
+/** A single model entry after formatting for the OpenAI-compatible /v1/models response */
+interface FormattedModel {
+  id: string
+  name: string
+  object: 'model'
+  owned_by: string
+  created: number
+  context_window?: number
+  capabilities?: string[]
+}
+
+/** The full formatted response returned by /v1/models */
+interface FormattedModelsResponse {
+  object: 'list'
+  data: FormattedModel[]
+}
 
 // Auto-detect system timezone
 const SYSTEM_TIMEZONE = (() => {
@@ -30,8 +61,8 @@ app.get('/v1/models', async (c) => {
       console.warn('Failed to retrieve account for models endpoint:', e)
     }
 
-    const cacheKey = `models:${accountId || 'global'}` as any
-    const cached = await cache.get<any>(cacheKey)
+    const cacheKey: CacheKey = `models:${accountId || 'global'}`
+    const cached = await cache.get<FormattedModelsResponse>(cacheKey)
     if (cached) {
       return c.json(cached)
     }
@@ -66,37 +97,38 @@ app.get('/v1/models', async (c) => {
     
     const models = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
     
-    const formatted = {
+    const formatted: FormattedModelsResponse = {
       object: 'list',
-      data: [
-        ...models.map((model: any) => ({
+      data: models.flatMap((model: QwenApiModel) => [
+        {
           id: model.id,
           name: model.name,
-          object: 'model',
+          object: 'model' as const,
           owned_by: model.owned_by,
           created: model.info?.created_at || Date.now(),
           context_window: model.info?.meta?.max_context_length,
           capabilities: model.info?.meta?.capabilities,
-        })),
-        ...models.map((model: any) => ({
+        },
+        {
           id: `${model.id}-no-thinking`,
           name: `${model.name} (No Thinking)`,
-          object: 'model',
+          object: 'model' as const,
           owned_by: model.owned_by,
           created: model.info?.created_at || Date.now(),
           context_window: model.info?.meta?.max_context_length,
           capabilities: model.info?.meta?.capabilities,
-        })),
-      ],
+        },
+      ]),
     }
 
     syncModelContextWindows(formatted.data)
     await cache.set(cacheKey, formatted, 300)
-    
+
     return c.json(formatted)
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
     console.error('Error fetching models:', error)
-    return c.json({ error: error.message }, 500)
+    return c.json({ error: message }, 500)
   }
 })
 
@@ -115,8 +147,8 @@ app.get('/v1/models/:model', async (c) => {
       console.warn('Failed to retrieve account for model endpoint:', e)
     }
 
-    const cacheKey = `models:${accountId || 'global'}` as any
-    const formattedList = await cache.get<any>(cacheKey)
+    const cacheKey: CacheKey = `models:${accountId || 'global'}`
+    const formattedList = await cache.get<FormattedModelsResponse>(cacheKey)
     let models = formattedList?.data || []
 
     if (models.length === 0) {
@@ -149,28 +181,28 @@ app.get('/v1/models/:model', async (c) => {
       const data = await response.json()
       const rawModels = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
       
-      const formatted = {
+      const formatted: FormattedModelsResponse = {
         object: 'list',
-        data: [
-          ...rawModels.map((model: any) => ({
+        data: rawModels.flatMap((model: QwenApiModel) => [
+          {
             id: model.id,
             name: model.name,
-            object: 'model',
+            object: 'model' as const,
             owned_by: model.owned_by,
             created: model.info?.created_at || Date.now(),
             context_window: model.info?.meta?.max_context_length,
             capabilities: model.info?.meta?.capabilities,
-          })),
-          ...rawModels.map((model: any) => ({
+          },
+          {
             id: `${model.id}-no-thinking`,
             name: `${model.name} (No Thinking)`,
-            object: 'model',
+            object: 'model' as const,
             owned_by: model.owned_by,
             created: model.info?.created_at || Date.now(),
             context_window: model.info?.meta?.max_context_length,
             capabilities: model.info?.meta?.capabilities,
-          })),
-        ],
+          },
+        ]),
       }
 
       syncModelContextWindows(formatted.data)
@@ -178,16 +210,17 @@ app.get('/v1/models/:model', async (c) => {
       models = formatted.data
     }
 
-    const model = models.find((m: any) => m.id === modelId)
-    
+    const model = models.find((m: FormattedModel) => m.id === modelId)
+
     if (!model) {
       return c.json({ error: 'Model not found' }, 404)
     }
-    
+
     return c.json(model)
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
     console.error('Error fetching model:', error)
-    return c.json({ error: error.message }, 500)
+    return c.json({ error: message }, 500)
   }
 })
 

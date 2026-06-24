@@ -1,7 +1,9 @@
 import type { Context } from 'hono';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import crypto from 'crypto';
 import { createQwenStream, RetryableQwenStreamError } from '../services/qwen.js';
-import type { OpenAIRequest } from '../utils/types.js';
+import type { OpenAIRequest, FunctionToolDefinition } from '../utils/types.js';
+import type { ChatSession } from '../core/session-manager.js';
 import { getModelContextWindow } from '../core/model-registry.js'
 import { truncateMessages, estimateTokenCount } from '../utils/context-truncation.js';
 import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, getAccountCooldownInfo } from '../core/account-manager.js';
@@ -18,26 +20,42 @@ import {
   buildCompactToolManifest,
   buildToolCallContract,
 } from './tool-handler.js';
-import { obfuscateToolName, deobfuscateToolName } from '../tools/obfuscation.js';
+import { obfuscateToolName } from '../tools/obfuscation.js';
 import { handleStreamingResponse, handleNonStreamingResponse } from './stream-handler.js';
 import { resolveSession, buildSessionContext, updateSessionState as updateSessionStateShared, releaseSessionFlight as releaseSessionFlightShared } from './request-executor.js';
 import { getPredictionCacheKey, cacheStreamingResponse, getCachedStreamingChunks, createReplayStream } from '../cache/prediction-cache.js';
-import { cache } from '../cache/memory-cache.js';
+import { cache, type CacheKey } from '../cache/memory-cache.js';
 
 function getCacheKey(prompt: string, model: string, thinking: boolean, thinkingEffort: string): string {
-  return `${model}:${thinking}:${thinkingEffort}:${prompt}`.slice(0, 64);
+  const raw = `${model}:${thinking}:${thinkingEffort}:${prompt}`;
+  // FNV-1a hash for fast, collision-resistant cache keys (avoids 64-char truncation collisions)
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < raw.length; i++) {
+    hash ^= raw.charCodeAt(i);
+    hash = (hash * 0x01000193) >>> 0;
+  }
+  return `cache:${hash.toString(36)}:${model}`;
 }
 
 export { getIncrementalDelta } from './sse-parser.js';
 export type { DeltaResult } from './sse-parser.js';
 
+/** A content part within a multimodal message content array */
+interface ContentPart {
+  type: string;
+  text?: string;
+  image_url?: { url: string };
+  video_url?: { url: string };
+  audio_url?: { url: string };
+  file_url?: { url: string };
+}
+
 export async function chatCompletions(c: Context) {
   const startTime = Date.now();
   const timer = new RequestTimer();
-  let body: OpenAIRequest;
-  let bodyAny: any;
+  let body: OpenAIRequest = { model: '', messages: [] };
   const dbg = getDebugLogger();
-  let activeSession: import('../core/session-manager.js').ChatSession | null = null;
+  let activeSession: ChatSession | null = null;
 
   const releaseMySession = () => {
     releaseSessionFlightShared(activeSession);
@@ -46,7 +64,6 @@ export async function chatCompletions(c: Context) {
 
   try {
     body = await c.req.json();
-    bodyAny = body as any;
     const isStream = body.stream ?? false;
 
     if (dbg.isEnabled()) {
@@ -54,9 +71,9 @@ export async function chatCompletions(c: Context) {
         model: body.model,
         stream: isStream,
         messageCount: body.messages?.length,
-        thinking: bodyAny.thinking,
-        thinkingEffort: bodyAny.thinking_effort,
-        hasTools: Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0,
+        thinking: body.thinking,
+        thinkingEffort: body.thinking_effort,
+        hasTools: Array.isArray(body.tools) && body.tools.length > 0,
       });
     }
 
@@ -65,9 +82,9 @@ export async function chatCompletions(c: Context) {
     const modelId = body.model.replace('-no-thinking', '');
     modelMapper.checkForReload();
     const mappingResult = modelMapper.resolve(modelId, {
-      tools: bodyAny.tools,
-      thinking: bodyAny.thinking,
-      effort: bodyAny.thinking_effort,
+      tools: body.tools,
+      thinking: body.thinking,
+      effort: body.thinking_effort,
     });
     const resolvedModel = mappingResult.targetModel;
 
@@ -82,16 +99,16 @@ export async function chatCompletions(c: Context) {
     });
 
     activeSession = sessionResult.activeSession;
-    let deltaStartIndex = sessionResult.deltaStartIndex;
+    const deltaStartIndex = sessionResult.deltaStartIndex;
 
     if (!sessionResult.resolved) {
-      return c.json(sessionResult.busyResponse.body, sessionResult.busyResponse.status as any);
+      return c.json(sessionResult.busyResponse.body, sessionResult.busyResponse.status as ContentfulStatusCode);
     }
     timer.mark('sessionReady');
 
     let prompt = '';
     let systemPrompt = '';
-    const pendingMultimodal: Array<Array<{ type: string; text?: string; image_url?: { url: string }; video_url?: { url: string }; audio_url?: { url: string }; file_url?: { url: string } }>> = [];
+    const pendingMultimodal: Array<Array<ContentPart>> = [];
 
     // In session mode, only process messages from deltaStartIndex onwards
     // (Qwen retains the full context server-side)
@@ -101,9 +118,9 @@ export async function chatCompletions(c: Context) {
       let contentStr = '';
       if (Array.isArray(msg.content)) {
         const textParts: string[] = [];
-        const multimodalParts: Array<{ type: string; text?: string; image_url?: { url: string }; video_url?: { url: string }; audio_url?: { url: string }; file_url?: { url: string } }> = [];
-        
-        for (const p of msg.content as any[]) {
+        const multimodalParts: Array<ContentPart> = [];
+
+        for (const p of msg.content as ContentPart[]) {
           if (p.type === "text" && p.text) {
             textParts.push(p.text);
           } else if (
@@ -132,14 +149,14 @@ export async function chatCompletions(c: Context) {
         prompt += `User: ${contentStr || ''}\n\n`;
       } else if (msg.role === 'assistant') {
         let assistantContent = contentStr || '';
-        const reasoning = (msg as any).reasoning_content;
+        const reasoning = msg.reasoning_content;
         if (reasoning) {
           assistantContent = `<think>\n${reasoning}\n</think>\n${assistantContent}`;
         }
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
            for (const tc of msg.tool_calls) {
              const args = tc.function?.arguments;
-             let parsedArgs: any = {};
+             let parsedArgs: Record<string, unknown> = {};
              if (typeof args === 'string') {
                try { parsedArgs = JSON.parse(args); } catch { parsedArgs = {}; }
              } else if (args && typeof args === 'object') {
@@ -169,20 +186,18 @@ export async function chatCompletions(c: Context) {
       }
     }
 
-    if (bodyAny.tools && Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0) {
-      const forcedToolName = getForcedToolName(bodyAny.tool_choice);
-      const parallelToolCalls = bodyAny.parallel_tool_calls !== false;
+    if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+      const forcedToolName = getForcedToolName(body.tool_choice);
+      const parallelToolCalls = body.parallel_tool_calls !== false;
 
-      const formattedTools = bodyAny.tools.map((t: any) => {
-        if (t.type === 'function') {
-          return {
-            name: obfuscateToolName(t.function.name),
-            description: t.function.description || '',
-            parameters: t.function.parameters
-          };
-        }
-        return { ...t, name: obfuscateToolName(t.name) };
-      });
+      const formattedTools: FunctionToolDefinition[] = body.tools.map((t) => ({
+        type: 'function',
+        function: {
+          name: obfuscateToolName(t.function.name),
+          description: t.function.description || '',
+          parameters: t.function.parameters,
+        },
+      }));
 
       // Use compact tool manifest + contract (existing infrastructure)
       const toolManifest = buildCompactToolManifest(formattedTools, forcedToolName);
@@ -190,8 +205,8 @@ export async function chatCompletions(c: Context) {
 
       systemPrompt += `\n\n${toolManifest}\n\n${toolContract}\n\n`;
       
-      if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
-        const forcedTool = bodyAny.tool_choice.function.name;
+      if (body.tool_choice && typeof body.tool_choice === 'object' && body.tool_choice.function) {
+        const forcedTool = body.tool_choice.function.name;
         systemPrompt += `CRITICAL: You MUST call the tool "${forcedTool}" in this response.\n\n`;
       }
     }
@@ -208,12 +223,12 @@ export async function chatCompletions(c: Context) {
     }
     const modelContextWindow = getModelContextWindow(resolvedModel)
     const estimatedTokens = estimateTokenCount(systemPrompt + prompt, resolvedModel);
-    const hasTools = Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0;
-    const forcedToolName = getForcedToolName(bodyAny.tool_choice);
-    const parallelToolCalls = bodyAny.parallel_tool_calls !== false;
+    const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
+    const forcedToolName = getForcedToolName(body.tool_choice);
+    const parallelToolCalls = body.parallel_tool_calls !== false;
     const toolContextText = `${systemPrompt}\n${prompt}`;
     const recentToolNames = hasTools ? getRecentToolNames(messages) : new Set<string>();
-    const candidateTools = hasTools ? selectCandidateTools(bodyAny.tools, toolContextText, forcedToolName, recentToolNames) : [];
+    const candidateTools = hasTools ? selectCandidateTools(body.tools!, toolContextText, forcedToolName, recentToolNames) : [];
     
     let finalPrompt: string;
     // Skip truncation when session is active (delta messages are small, Qwen retains full context)
@@ -232,11 +247,11 @@ export async function chatCompletions(c: Context) {
       if (compactManifest) finalPrompt += `\n\n${compactManifest}`;
     }
 
-    const isThinkingModel = bodyAny.thinking !== undefined
-      ? !!bodyAny.thinking
+    const isThinkingModel = body.thinking !== undefined
+      ? !!body.thinking
       : !resolvedModel.includes('no-thinking');
 
-    const thinkingMode = bodyAny.thinking_effort || 'Thinking';
+    const thinkingMode = body.thinking_effort || 'Thinking';
 
     const isGuestModeOnly = process.env.QWEN_GUEST_MODE_ONLY?.toLowerCase() === 'true';
     let stream: ReadableStream | undefined;
@@ -245,12 +260,12 @@ export async function chatCompletions(c: Context) {
 
     // Build session context for createQwenStream (null if no active session)
     const sessionContext = await buildSessionContext(activeSession);
-    let lastError: any = null;
+    let lastError: Error | { message?: string; upstreamStatus?: number; upstreamCode?: string } | null = null;
 
     // Check response cache for non-streaming requests
     if (!isStream) {
       const cacheKey = getCacheKey(finalPrompt, resolvedModel, isThinkingModel, thinkingMode);
-      const cached = await cache.get(cacheKey as any);
+      const cached = await cache.get(cacheKey as unknown as CacheKey);
       if (cached) {
         metrics.increment('cache.hit');
         if (dbg.isEnabled()) {
@@ -315,8 +330,8 @@ export async function chatCompletions(c: Context) {
           targetResponseId: '',
           headers: result.headers,
         });
-      } catch (err: any) {
-        console.error('[Chat] Guest mode failed:', err.message);
+      } catch (err: unknown) {
+        console.error('[Chat] Guest mode failed:', err instanceof Error ? err.message : String(err));
         throw err;
       }
     } else {
@@ -363,11 +378,13 @@ export async function chatCompletions(c: Context) {
               sessionContext,
             );
             return result;
-          } catch (err: any) {
+          } catch (err: unknown) {
             retries--;
 
-            if (err.upstreamCode === 'RateLimited' || err.upstreamStatus === 429) {
-              const hourHint = err.message?.match(/Wait about (\d+) hour/);
+            const errObj = err as { message?: string; upstreamCode?: string; upstreamStatus?: number };
+
+            if (errObj.upstreamCode === 'RateLimited' || errObj.upstreamStatus === 429) {
+              const hourHint = errObj.message?.match(/Wait about (\d+) hour/);
               const hours = hourHint ? parseInt(hourHint[1]) : 24;
               const cooldownMs = hours * 60 * 60 * 1000;
               markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
@@ -376,7 +393,7 @@ export async function chatCompletions(c: Context) {
             }
 
             if (retries === 0) {
-              if (err.upstreamStatus && err.upstreamStatus >= 500) {
+              if (errObj.upstreamStatus && errObj.upstreamStatus >= 500) {
                 markAccountRateLimited(accountId, undefined, 'ServerError');
                 console.warn(`[Chat] Account ${accountEmail} (${accountId}) returned server error. Marked for cooldown.`);
               }
@@ -387,7 +404,7 @@ export async function chatCompletions(c: Context) {
             if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
               useDelay = err.retryAfterMs;
             }
-            const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+            const isRetryable = err instanceof RetryableQwenStreamError || errObj.message?.includes('in progress') || errObj.message?.includes('Bad_Request');
             if (!isRetryable) {
               throw err;
             }
@@ -401,11 +418,28 @@ export async function chatCompletions(c: Context) {
 
       // Race all candidate accounts in parallel
       if (candidateAccounts.length > 0) {
-        const accountPromises = candidateAccounts.map(acc => tryAccountWithRetries(acc.id, acc.email));
+        // Track partial results per account to abort losers after Promise.any
+        const partialResults: Array<{ accountId: string; email: string; result?: { stream: ReadableStream; uiSessionId: string; controller: AbortController; accountId: string; headers: Record<string, string> }; index: number }> =
+          candidateAccounts.map((acc, i) => ({ accountId: acc.id, email: acc.email, index: i }));
+
+        const accountPromises = candidateAccounts.map((acc, i) =>
+          tryAccountWithRetries(acc.id, acc.email).then(result => {
+            partialResults[i].result = result;
+            return result;
+          })
+        );
         try {
           const result = await Promise.any(accountPromises);
           stream = result.stream;
           uiSessionId = result.uiSessionId;
+
+          // Abort losing account streams to prevent upstream connection leaks
+          for (const pr of partialResults) {
+            if (pr.result && pr.result !== result && pr.result.controller) {
+              try { pr.result.controller.abort(); } catch { /* ignore */ }
+            }
+          }
+
           const streamCreationMs = Date.now() - startTime;
           console.log(`[Chat] Stream created in ${streamCreationMs}ms via parallel account racing (${candidateAccounts.length} accounts)`);
           if (dbg.isEnabled()) {
@@ -422,16 +456,17 @@ export async function chatCompletions(c: Context) {
             targetResponseId: '',
             headers: result.headers,
           });
-        } catch (aggregateErr: any) {
+        } catch (aggregateErr: unknown) {
           // All accounts failed — record errors for fallback logic
           if (aggregateErr instanceof AggregateError) {
             for (const err of aggregateErr.errors) {
-              console.error(`[Chat] Parallel account attempt failed:`, err.message);
-              lastError = err;
+              console.error(`[Chat] Parallel account attempt failed:`, err instanceof Error ? err.message : String(err));
+              lastError = err instanceof Error ? err : new Error(String(err));
             }
           } else {
-            console.error(`[Chat] All parallel account attempts failed:`, aggregateErr.message);
-            lastError = aggregateErr;
+            const msg = aggregateErr instanceof Error ? aggregateErr.message : String(aggregateErr);
+            console.error(`[Chat] All parallel account attempts failed:`, msg);
+            lastError = aggregateErr instanceof Error ? aggregateErr : new Error(msg);
           }
         }
       }
@@ -467,9 +502,9 @@ export async function chatCompletions(c: Context) {
               targetResponseId: '',
               headers: result.headers,
             });
-          } catch (defaultErr: any) {
-            console.warn('[Chat] Default session failed:', defaultErr.message);
-            lastError = defaultErr;
+          } catch (defaultErr: unknown) {
+            console.warn('[Chat] Default session failed:', defaultErr instanceof Error ? defaultErr.message : String(defaultErr));
+            lastError = defaultErr instanceof Error ? defaultErr : new Error(String(defaultErr));
           }
         }
 
@@ -497,8 +532,8 @@ export async function chatCompletions(c: Context) {
               targetResponseId: '',
               headers: result.headers,
             });
-          } catch (guestErr: any) {
-            console.error('[Chat] Guest mode also failed:', guestErr.message);
+          } catch (guestErr: unknown) {
+            console.error('[Chat] Guest mode also failed:', guestErr instanceof Error ? guestErr.message : String(guestErr));
             throw lastError || new Error('All accounts and guest mode failed');
           }
         }
@@ -517,7 +552,7 @@ export async function chatCompletions(c: Context) {
     };
 
     if (!isStream) {
-      const response = await handleNonStreamingResponse(c, stream!, completionId, resolvedModel, uiSessionId, hasTools, bodyAny.tools || []);
+      const response = await handleNonStreamingResponse(c, stream!, completionId, resolvedModel, uiSessionId, hasTools, body.tools || []);
       // Update session state after stream fully consumed (non-streaming)
       doUpdateSessionState();
       // Cache non-streaming responses
@@ -525,7 +560,7 @@ export async function chatCompletions(c: Context) {
         const cacheKey = getCacheKey(finalPrompt, resolvedModel, isThinkingModel, thinkingMode);
         const bodyClone = response.clone();
         const json = await bodyClone.json();
-        await cache.set(cacheKey as any, json, 300);
+        await cache.set(cacheKey as unknown as CacheKey, json, 300);
       } catch { /* ignore cache errors */ }
       // Log successful request
       const endTime = Date.now();
@@ -536,10 +571,10 @@ export async function chatCompletions(c: Context) {
         endpoint: '/v1/chat/completions',
         clientIp: c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown',
         userAgent: c.req.header('user-agent') || 'unknown',
-        thinking: bodyAny.thinking || false,
-        thinkingEffort: bodyAny.thinking_effort,
-        hasTools: Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0,
-        toolNames: bodyAny.tools?.map((t: any) => t.function?.name || t.name),
+        thinking: body.thinking || false,
+        thinkingEffort: body.thinking_effort,
+        hasTools: Array.isArray(body.tools) && body.tools.length > 0,
+        toolNames: body.tools?.map((t) => t.function.name).filter((n): n is string => n !== undefined),
         streamMode: false,
         inputTokens: 0,
         outputTokens: 0,
@@ -572,10 +607,10 @@ export async function chatCompletions(c: Context) {
       endpoint: '/v1/chat/completions',
       clientIp: c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown',
       userAgent: c.req.header('user-agent') || 'unknown',
-      thinking: bodyAny.thinking || false,
-      thinkingEffort: bodyAny.thinking_effort,
-      hasTools: Array.isArray(bodyAny.tools) && bodyAny.tools.length > 0,
-      toolNames: bodyAny.tools?.map((t: any) => t.function?.name || t.name),
+      thinking: body.thinking || false,
+      thinkingEffort: body.thinking_effort,
+      hasTools: Array.isArray(body.tools) && body.tools.length > 0,
+      toolNames: body.tools?.map((t) => t.function.name).filter((n): n is string => n !== undefined),
       streamMode: true,
       inputTokens: 0,
       outputTokens: 0,
@@ -598,7 +633,6 @@ export async function chatCompletions(c: Context) {
       const originalReader = stream.getReader();
       const decoder = new TextDecoder();
       const capturedChunks: string[] = [];
-      let captureCompleted = false;
 
       streamForHandler = new ReadableStream({
         async pull(controller) {
@@ -616,7 +650,6 @@ export async function chatCompletions(c: Context) {
                   });
                 }
               }
-              captureCompleted = true;
               controller.close();
               return;
             }
@@ -624,9 +657,9 @@ export async function chatCompletions(c: Context) {
             capturedChunks.push(decoder.decode(value, { stream: true }));
             // Forward to consumer
             controller.enqueue(value);
-          } catch (err) {
+          } catch {
             // On error, don't cache partial responses
-            try { controller.close(); } catch {}
+            try { controller.close(); } catch { /* already closed */ }
           }
         },
         cancel() {
@@ -641,7 +674,7 @@ export async function chatCompletions(c: Context) {
       model: resolvedModel,
       uiSessionId,
       hasTools,
-      tools: bodyAny.tools || [],
+      tools: body.tools || [],
       finalPrompt,
       streamOptions: body.stream_options,
       sessionId: activeSession?.sessionId,
@@ -650,21 +683,22 @@ export async function chatCompletions(c: Context) {
         releaseMySession();
       },
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     // Log failed request
     const endTime = Date.now();
+    const errObj = err as { message?: string; upstreamStatus?: number; upstreamCode?: string; stack?: string };
     requestLogger.log({
-      originalModel: bodyAny?.model || 'unknown',
-      mappedModel: bodyAny?.model || 'unknown',
+      originalModel: body?.model || 'unknown',
+      mappedModel: body?.model || 'unknown',
       protocol: 'openai',
       endpoint: '/v1/chat/completions',
       clientIp: c.req.header('x-forwarded-for') || c.req.header('x-real-ip') || 'unknown',
       userAgent: c.req.header('user-agent') || 'unknown',
-      thinking: bodyAny?.thinking || false,
-      thinkingEffort: bodyAny?.thinking_effort,
-      hasTools: Array.isArray(bodyAny?.tools) && bodyAny.tools.length > 0,
-      toolNames: bodyAny?.tools?.map((t: any) => t.function?.name || t.name),
-      streamMode: bodyAny?.stream || false,
+      thinking: body?.thinking || false,
+      thinkingEffort: body?.thinking_effort,
+      hasTools: Array.isArray(body?.tools) && (body?.tools?.length ?? 0) > 0,
+      toolNames: body?.tools?.map((t) => t.function.name).filter((n): n is string => n !== undefined),
+      streamMode: body?.stream || false,
       inputTokens: 0,
       outputTokens: 0,
       cacheTokens: 0,
@@ -672,9 +706,9 @@ export async function chatCompletions(c: Context) {
       startTime,
       endTime,
       success: false,
-      statusCode: err.upstreamStatus || 500,
-      errorCode: err.upstreamCode,
-      errorMessage: err.message,
+      statusCode: errObj.upstreamStatus || 500,
+      errorCode: errObj.upstreamCode,
+      errorMessage: errObj.message,
       accountId: 'unknown',
       accountSelectionMs: timer.elapsed('sessionReady'),
       streamCreationMs: timer.elapsed('streamReady') - timer.elapsed('streamStart'),
@@ -683,20 +717,20 @@ export async function chatCompletions(c: Context) {
     });
     console.error('Error in chatCompletions:', err)
     if (dbg.isEnabled()) {
-      dbg.log('ERROR', 'chat.ts', `Chat completion failed: ${err.message}`, {
-        model: bodyAny?.model,
-        error: err.message,
-        stack: err.stack?.split('\n').slice(0, 5).join('\n'),
-        upstreamStatus: err.upstreamStatus,
-        upstreamCode: err.upstreamCode,
+      dbg.log('ERROR', 'chat.ts', `Chat completion failed: ${errObj.message}`, {
+        model: body?.model,
+        error: errObj.message,
+        stack: errObj.stack?.split('\n').slice(0, 5).join('\n'),
+        upstreamStatus: errObj.upstreamStatus,
+        upstreamCode: errObj.upstreamCode,
       });
     }
-    const status = err.upstreamStatus || 500
+    const status = (errObj.upstreamStatus || 500) as ContentfulStatusCode
     if (status >= 500) {
       metrics.increment('requests.errors')
     }
     releaseMySession();
-    return c.json({ error: { message: err.message } }, status)
+    return c.json({ error: { message: errObj.message } }, status)
   }
 }
 
@@ -742,7 +776,7 @@ export async function chatCompletionsStop(c: Context) {
     if (!stopResponse.ok) {
       const errorText = await stopResponse.text();
       console.error(`[Stop] Failed to stop generation for chat_id=${chat_id}: ${stopResponse.status} ${errorText}`);
-      return c.json({ error: 'Failed to stop generation' }, stopResponse.status as any);
+      return c.json({ error: 'Failed to stop generation' }, stopResponse.status as ContentfulStatusCode);
     }
 
     stream.abortController.abort();
@@ -750,8 +784,8 @@ export async function chatCompletionsStop(c: Context) {
 
     console.log(`[Stop] Generation stopped for chat_id=${chat_id}`);
     return c.json({ success: true });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error('Error in chatCompletionsStop:', err);
-    return c.json({ error: err.message }, 500);
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }

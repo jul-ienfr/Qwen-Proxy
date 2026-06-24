@@ -5,7 +5,7 @@ import { config } from '../core/config.js';
 import { isMouseLocked } from './mouse-lock.js';
 import { isAccountLaneId } from '../core/account-lanes.js';
 
-const KEEP_ALIVE_INTERVAL_MS = 3 * 60 * 1000;
+const KEEP_ALIVE_INTERVAL_MS = 2 * 60 * 1000; // Reduced from 3min — more frequent presence
 const NAVIGATION_INTERVAL_MS = 8 * 60 * 1000;
 
 let running = false;
@@ -19,18 +19,39 @@ async function performKeepAlive(accountId: string, page: Page): Promise<void> {
     const viewport = page.viewportSize();
     if (!viewport) return;
 
-    const points = 2 + Math.floor(Math.random() * 2);
+    // 3-5 random mouse movements (increased from 2-3)
+    const points = 3 + Math.floor(Math.random() * 3);
     for (let i = 0; i < points; i++) {
       const fromX = Math.floor(Math.random() * viewport.width);
       const fromY = Math.floor(Math.random() * viewport.height);
       const toX = Math.floor(Math.random() * viewport.width);
       const toY = Math.floor(Math.random() * viewport.height);
       await humanMouseMove(page, fromX, fromY, toX, toY, { overshoot: 0 });
-      await sleep(humanDelay(300, 800));
+      await sleep(humanDelay(200, 600));
     }
 
-    if (Math.random() < 0.4) {
+    // Scroll with 60% probability (increased from 40%)
+    if (Math.random() < 0.6) {
       await humanScroll(page);
+    }
+
+    // Keyboard activity — press random keys to simulate typing presence
+    if (Math.random() < 0.3) {
+      const keys = ['ArrowDown', 'ArrowUp', 'End', 'Home'];
+      const key = keys[Math.floor(Math.random() * keys.length)];
+      await page.keyboard.press(key).catch(() => {});
+      await sleep(humanDelay(100, 300));
+    }
+
+    // Focus/blur events to simulate tab switching
+    if (Math.random() < 0.2) {
+      await page.evaluate(() => {
+        try {
+          window.dispatchEvent(new Event('blur'));
+          setTimeout(() => window.dispatchEvent(new Event('focus')), 200 + Math.random() * 500);
+        } catch { /* ignore */ }
+      }).catch(() => {});
+      await sleep(humanDelay(300, 800));
     }
 
     const now = Date.now();

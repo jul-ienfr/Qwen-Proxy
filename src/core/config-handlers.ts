@@ -82,12 +82,12 @@ async function handleBrowserContextRecreate(): Promise<void> {
   // The new userAgent will be used in the next context creation
 }
 
-function handleMetricsRestart(): void {
+async function handleMetricsRestart(): Promise<void> {
   console.log('[ConfigHandler] Metrics interval changed, restart needed on next collection cycle')
   // Metrics reads config.metrics.interval dynamically in startCollection
   // The setInterval is already set — restart is needed
   try {
-    const { metrics } = require('./metrics.js')
+    const { metrics } = await import('./metrics.js')
     metrics.stopCollection()
     metrics.startCollection()
     console.log('[ConfigHandler] Metrics collection restarted')
@@ -102,24 +102,24 @@ function handleWatchdogRestart(): void {
   // A restart would be needed for the interval to take effect
 }
 
-function handleDebugBufferSize(size: number): void {
+async function handleDebugBufferSize(size: number): Promise<void> {
   try {
-    const { getDebugLogger } = require('./debug-logger.js')
+    const { getDebugLogger } = await import('./debug-logger.js')
     const logger = getDebugLogger()
-    logger.maxSize = size
+    logger.setBufferSize(size)
     console.log(`[ConfigHandler] Debug buffer size updated to ${size}`)
   } catch (err: any) {
     console.error('[ConfigHandler] Failed to update debug buffer size:', err.message)
   }
 }
 
-function handleLoggingToggle(enabled: boolean): void {
+async function handleLoggingToggle(enabled: boolean): Promise<void> {
   try {
-    const { requestLogger } = require('./request-logger.js')
+    const { requestLogger } = await import('./request-logger.js')
     if (enabled) {
-      requestLogger.enable()
+      requestLogger.start()
     } else {
-      requestLogger.disable()
+      requestLogger.stop()
     }
     console.log(`[ConfigHandler] Request logging ${enabled ? 'enabled' : 'disabled'}`)
   } catch (err: any) {

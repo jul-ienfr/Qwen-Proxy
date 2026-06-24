@@ -1,8 +1,14 @@
 import { EventEmitter } from 'events'
 import { config } from './config.js'
 
+interface HistogramData {
+  count: number
+  sum: number
+  buckets: Map<number, number>
+}
+
 interface MetricPoint {
-  value: number
+  value: number | HistogramData
   timestamp: number
   labels?: Record<string, string>
 }
@@ -66,7 +72,7 @@ export class Metrics extends EventEmitter {
     if (!metric || metric.type !== 'counter') return
 
     const key = labels ? JSON.stringify(labels) : 'default'
-    const current = metric.values.get(key)?.value || 0
+    const current = (metric.values.get(key)?.value as number) || 0
     metric.values.set(key, { value: current + value, timestamp: Date.now(), labels })
     this.emit('metric', { name, type: 'counter', value: current + value, labels })
   }
@@ -80,7 +86,7 @@ export class Metrics extends EventEmitter {
     if (!metric || metric.type !== 'gauge') return
 
     const key = labels ? JSON.stringify(labels) : 'default'
-    metric.values.set(key, { value, timestamp: Date.now(), labels })
+    metric.values.set(key, { value: value as number, timestamp: Date.now(), labels })
     this.emit('metric', { name, type: 'gauge', value, labels })
   }
 
@@ -100,7 +106,7 @@ export class Metrics extends EventEmitter {
       }
     }
 
-    metric.values.set(key, { value: data as any, timestamp: Date.now(), labels })
+    metric.values.set(key, { value: data as HistogramData, timestamp: Date.now(), labels })
     this.emit('metric', { name, type: 'histogram', value, labels })
   }
 
@@ -146,7 +152,18 @@ export class Metrics extends EventEmitter {
         const labelsStr = point.labels
           ? `{${Object.entries(point.labels).map(([k, v]) => `${k}="${v}"`).join(',')}}`
           : ''
-        output += `${metric.name}${labelsStr} ${point.value} ${point.timestamp}\n`
+
+        if (metric.type === 'histogram' && typeof point.value === 'object' && point.value !== null && 'count' in point.value) {
+          const hist = point.value as HistogramData
+          for (const [le, count] of hist.buckets) {
+            output += `${metric.name}_bucket${labelsStr}{le="${le}"} ${count} ${point.timestamp}\n`
+          }
+          output += `${metric.name}_bucket${labelsStr}{le="+Inf"} ${hist.count} ${point.timestamp}\n`
+          output += `${metric.name}_sum${labelsStr} ${hist.sum} ${point.timestamp}\n`
+          output += `${metric.name}_count${labelsStr} ${hist.count} ${point.timestamp}\n`
+        } else {
+          output += `${metric.name}${labelsStr} ${point.value} ${point.timestamp}\n`
+        }
       }
     }
     return output

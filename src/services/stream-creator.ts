@@ -6,6 +6,7 @@ import { getWarmedChat, releaseWarmChat } from './warm-pool.js';
 import crypto from 'crypto';
 import { getDebugLogger } from '../core/debug-logger.js';
 import { browserStreamFetchWS } from './stream-ws-bridge.js';
+import { waitForSolved } from './captcha-solver.js';
 
 const CACHED_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const TIMEOUT_PER_MB = 30000;
@@ -736,9 +737,9 @@ export async function createQwenStream(
           lastBrowserError = fetchErr;
           if (attempt < maxBrowserRetries - 1) {
             if (dbg.isEnabled()) {
-              dbg.log('STREAM', 'stream-creator.ts', 'Waiting 5s for captcha solve before retry', { chatId: targetChatId });
+              dbg.log('STREAM', 'stream-creator.ts', 'Waiting for captcha solve before retry (event-driven)', { chatId: targetChatId });
             }
-            await sleep(5000);
+            await waitForSolved(5000);
             continue;
           }
           break;
@@ -762,7 +763,7 @@ export async function createQwenStream(
           if (dbg.isEnabled()) {
             dbg.log('STREAM', 'stream-creator.ts', `Browser fetch got TMD challenge (attempt ${attempt + 1}/${maxBrowserRetries}). Waiting for captcha solve`, { chatId: targetChatId, attempt: attempt + 1 });
           }
-          await sleep(2000); // Wait 2s for captcha to be solved
+          await waitForSolved(3000); // Wait for captcha solve (event-driven, up to 3s)
           continue;
         }
 
@@ -809,7 +810,7 @@ export async function createQwenStream(
           // Try to refresh headers and create fresh chat
           try {
             const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
-            await sleep(500 + Math.floor(Math.random() * 1000));
+            await sleep(300 + Math.floor(Math.random() * 500));
 
             const freshChatBody = JSON.stringify({
               title: 'Nova Conversa',

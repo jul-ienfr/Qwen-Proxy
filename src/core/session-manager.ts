@@ -56,6 +56,8 @@ class SessionManager {
   /** Per-session message fingerprints: sessionId -> Map<index, fingerprint> */
   private fingerprints = new Map<string, Map<number, string>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Locks to prevent concurrent getOrCreate for the same sessionId */
+  private creationLocks = new Map<string, Promise<ChatSession>>();
 
   constructor() {
     this.startCleanupTimer();
@@ -90,7 +92,24 @@ class SessionManager {
       }
     }
 
+    // Prevent concurrent creation for the same sessionId (race condition guard)
+    const existingLock = this.creationLocks.get(sessionId);
+    if (existingLock) {
+      return existingLock;
+    }
+
     // Create new session with warm pool chat
+    const creationPromise = this.doCreateSession(sessionId, options);
+    this.creationLocks.set(sessionId, creationPromise);
+
+    try {
+      return await creationPromise;
+    } finally {
+      this.creationLocks.delete(sessionId);
+    }
+  }
+
+  private async doCreateSession(sessionId: string, options: SessionCreateOptions): Promise<ChatSession> {
     const accountKey = options.accountId || undefined;
     const warmedChat = await getWarmedChat(accountKey);
 
@@ -185,7 +204,7 @@ class SessionManager {
    * Remove all sessions.
    */
   removeAll(): void {
-    for (const [id, session] of this.sessions) {
+    for (const [, session] of this.sessions) {
       releaseWarmChat(session.accountId, session.chatId);
     }
     this.sessions.clear();

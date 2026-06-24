@@ -8,6 +8,8 @@
 import type { Context, Next } from 'hono';
 import { getConfigManager, type ConfigChangeEvent } from '../core/config-manager.js';
 
+const MAX_STORE_KEYS = 10000; // Cap on unique rate-limit keys to prevent unbounded memory growth
+
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface RateLimitConfig {
@@ -134,12 +136,25 @@ export class RateLimiter {
       // Get or create store
       let store = this.stores.get(key);
       if (!store) {
+        // Cap total keys to prevent unbounded memory growth
+        if (this.stores.size >= MAX_STORE_KEYS) {
+          // Evict the oldest key (first inserted)
+          const firstKey = this.stores.keys().next().value;
+          if (firstKey !== undefined) this.stores.delete(firstKey);
+        }
         store = { timestamps: [] };
         this.stores.set(key, store);
       }
 
-      // Remove expired timestamps (sliding window: keep only entries within window)
-      store.timestamps = store.timestamps.filter(t => t > windowStart);
+      // Remove expired timestamps using index-based trim (no array allocation)
+      const ts = store.timestamps;
+      let trimIdx = 0;
+      while (trimIdx < ts.length && ts[trimIdx] <= windowStart) trimIdx++;
+      if (trimIdx > 0) {
+        // Shift remaining elements instead of creating a new array
+        for (let i = 0; i < ts.length - trimIdx; i++) ts[i] = ts[i + trimIdx];
+        ts.length -= trimIdx;
+      }
 
       // Check if rate limit exceeded
       if (store.timestamps.length >= this.config.maxRequests) {
@@ -186,7 +201,14 @@ export class RateLimiter {
     const now = Date.now();
     const windowStart = now - this.config.windowMs;
     for (const [key, store] of this.stores) {
-      store.timestamps = store.timestamps.filter(t => t > windowStart);
+      // Index-based trim instead of filter (no allocation)
+      const ts = store.timestamps;
+      let trimIdx = 0;
+      while (trimIdx < ts.length && ts[trimIdx] <= windowStart) trimIdx++;
+      if (trimIdx > 0) {
+        for (let i = 0; i < ts.length - trimIdx; i++) ts[i] = ts[i + trimIdx];
+        ts.length -= trimIdx;
+      }
       if (store.timestamps.length === 0) {
         this.stores.delete(key);
       }

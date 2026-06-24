@@ -48,9 +48,11 @@ class DebugLogger {
   private buffer: DebugLogEntry[] = []
   private maxSize: number
   private enabled: boolean = false
+  private evictThreshold: number // Trigger eviction at 2x to amortize cost
 
   constructor() {
     this.maxSize = config.debug.bufferSize
+    this.evictThreshold = this.maxSize * 2
     const state = getDebugState()
     this.enabled = state.isEnabled()
 
@@ -83,9 +85,9 @@ class DebugLogger {
 
     this.buffer.push(entry)
 
-    // Evict oldest if over capacity
-    if (this.buffer.length > this.maxSize) {
-      this.buffer.splice(0, this.buffer.length - this.maxSize)
+    // Batch eviction: let buffer grow to 2x, then truncate by reassignment (O(1) amortized)
+    if (this.buffer.length > this.evictThreshold) {
+      this.buffer = this.buffer.slice(this.buffer.length - this.maxSize)
     }
   }
 
@@ -138,6 +140,15 @@ class DebugLogger {
     const count = this.buffer.length
     this.buffer = []
     return count
+  }
+
+  setBufferSize(size: number): void {
+    this.maxSize = Math.max(100, size)
+    this.evictThreshold = this.maxSize * 2
+    // Evict excess entries immediately
+    if (this.buffer.length > this.maxSize) {
+      this.buffer = this.buffer.slice(this.buffer.length - this.maxSize)
+    }
   }
 
   getStats(): { total: number; enabled: boolean; maxSize: number } {

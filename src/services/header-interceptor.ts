@@ -77,7 +77,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{ cookie: str
 
   if (!bxUa || !bxUmidtoken) {
     // Try loading from disk cache first (saves 10-30s on cold start)
-    const diskCache = loadCachedHeaders(cacheKey);
+    const diskCache = await loadCachedHeaders(cacheKey);
     if (diskCache && diskCache.bxUa && diskCache.bxUmidtoken) {
       console.log(`[Playwright] Using disk-cached headers for ${cacheKey}`);
       bxUa = diskCache.bxUa;
@@ -477,7 +477,7 @@ async function _getQwenHeadersInternalOnce(forceNew = false, accountId?: string)
         cache.refreshInProgress = false;
 
         // Persist headers to disk for faster cold start
-        saveCachedHeaders(cacheKey, {
+        await saveCachedHeaders(cacheKey, {
           cookie: extractedHeaders['cookie'] || '',
           userAgent: extractedHeaders['user-agent'] || '',
           bxV: extractedHeaders['bx-v'] || '2.5.36',

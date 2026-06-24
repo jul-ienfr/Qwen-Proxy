@@ -80,6 +80,39 @@ export async function humanMouseMove(
   await page.mouse.move(toX, toY);
 }
 
+/**
+ * Fast drag variant for captcha solving — fewer steps, tighter delays.
+ * Still uses Bezier curves + overshoot for human-like appearance, but ~60% faster.
+ */
+export async function humanDragFast(page: Page, fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
+  const startX = fromX + gaussianRandom(simpleRng) * 3, startY = fromY + gaussianRandom(simpleRng) * 3;
+  // Quick position — single move (steps:1 = 1 IPC call)
+  await page.mouse.move(startX, startY, { steps: 1 });
+  await sleep(logNormalDelay(simpleRng, 20, 40));
+  await page.mouse.down();
+  await sleep(logNormalDelay(simpleRng, 20, 40));
+  const dx = toX - startX, dy = toY - startY, distance = Math.sqrt(dx * dx + dy * dy);
+  const overshoot = 5 + Math.floor(simpleRng() * 8), steps = 10 + Math.floor(simpleRng() * 6);
+  const cp1x = startX + dx * 0.3 + gaussianRandom(simpleRng) * distance * 0.04;
+  const cp1y = startY + dy * 0.3 + gaussianRandom(simpleRng) * distance * 0.06;
+  const cp2x = startX + dx * 0.7 + gaussianRandom(simpleRng) * distance * 0.04;
+  const cp2y = startY + dy * 0.7 + gaussianRandom(simpleRng) * distance * 0.06;
+  const overshootX = toX + (dx > 0 ? overshoot : -overshoot), overshootY = toY + gaussianRandom(simpleRng) * 3;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    let x: number, y: number;
+    if (t < 0.8) { const a = t / 0.8; x = cubicBezier(startX, cp1x, cp2x, overshootX, a); y = cubicBezier(startY, cp1y, cp2y, overshootY, a); }
+    else { const c = (t - 0.8) / 0.2; const e = 1 - Math.pow(1 - c, 3); x = overshootX + (toX - overshootX) * e; y = overshootY + (toY - overshootY) * e; }
+    x += gaussianRandom(simpleRng) * 1.0; y += gaussianRandom(simpleRng) * 1.0;
+    await page.mouse.move(x, y, { steps: 1 });
+    const accel = t < 0.3 ? 0.6 : t < 0.7 ? 1.0 : 1.4;
+    await sleep(logNormalDelay(simpleRng, 4 * accel, 12 * accel));
+  }
+  // Skip final move — last position is close enough due to easing
+  await sleep(logNormalDelay(simpleRng, 40, 100));
+  await page.mouse.up();
+}
+
 export async function humanDrag(page: Page, fromX: number, fromY: number, toX: number, toY: number): Promise<void> {
   const startX = fromX + gaussianRandom(simpleRng) * 3, startY = fromY + gaussianRandom(simpleRng) * 3;
   await humanMouseMove(page, startX + gaussianRandom(simpleRng) * 50, startY + gaussianRandom(simpleRng) * 50, startX, startY, { overshoot: 0, steps: 8 });

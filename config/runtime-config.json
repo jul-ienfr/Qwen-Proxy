@@ -5,5 +5,6 @@
   "useWsBridge": false,
   "directFetch": true,
   "tlsH2Enabled": false,
-  "browser.headless": false
+  "browser.headless": false,
+  "browser.type": "chromium"
 }

@@ -1,6 +1,9 @@
 import type { Context } from 'hono';
+import type { StreamingApi } from 'hono/utils/stream';
+import type { ContentfulStatusCode } from 'hono/utils/http-status';
 import { stream as honoStream } from 'hono/streaming';
 import { StreamingToolParser } from '../tools/parser.js';
+import type { FunctionToolDefinition } from '../tools/types.js';
 import { QwenStreamParser } from '../utils/qwen-stream-parser.js';
 import { getIncrementalDelta, parseQwenErrorPayload } from './sse-parser.js';
 import { looksLikeUnwrappedToolCall, parseUnwrappedToolCalls } from './tool-handler.js';
@@ -10,6 +13,7 @@ import { updateSessionParent } from '../services/qwen.js';
 import { createDirectStreamProxy, extractFast, extractJsonString } from '../services/direct-stream-proxy.js';
 import { config } from '../core/config.js';
 import { escapeJsonStringFast } from '../utils/fast-escape.js';
+import { extractLineFromChunks } from '../utils/line-extractor.js';
 
 export interface StreamHandlerContext {
   stream: ReadableStream;
@@ -17,7 +21,7 @@ export interface StreamHandlerContext {
   model: string;
   uiSessionId: string;
   hasTools: boolean;
-  tools: any[];
+  tools: FunctionToolDefinition[];
   finalPrompt: string;
   streamOptions?: { include_usage?: boolean };
   sessionId?: string;
@@ -29,9 +33,10 @@ export interface StreamHandlerContext {
  * Bypasses the full JSON.parse → transform → JSON.stringify pipeline.
  * Expected improvement: 10-50x per chunk.
  */
-function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any {
+function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): Response {
   console.log(`[FastStream] Using fast path for ${ctx.completionId} (model: ${ctx.model})`);
-  const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+  const socket = (c.env as { incoming?: { socket?: { setNoDelay?: (flag: boolean) => void } } })?.incoming?.socket
+    || (c.req.raw as unknown as { socket?: { setNoDelay?: (flag: boolean) => void } }).socket;
   if (socket && typeof socket.setNoDelay === 'function') {
     socket.setNoDelay(true);
   }
@@ -44,9 +49,9 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
     c.header('X-QwenProxy-Session-Id', ctx.sessionId);
   }
 
-  return honoStream(c, async (streamWriter: any) => {
-    let heartbeatInterval: any;
-    let usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+  return honoStream(c, async (streamWriter: StreamingApi) => {
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
+    const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 
     try {
       await streamWriter.write(': heartbeat\n\n');
@@ -57,7 +62,8 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
       }, 15000);
       if (heartbeatInterval.unref) heartbeatInterval.unref();
 
-      const proxyStream = createDirectStreamProxy(ctx.stream as any, {
+      // eslint-disable-next-line @typescript-eslint/consistent-type-imports -- Node.js ReadableStream conflicts with DOM ReadableStream
+      const proxyStream = createDirectStreamProxy(ctx.stream as unknown as import('stream/web').ReadableStream<Uint8Array>, {
         completionId: ctx.completionId,
         model: ctx.model,
         hasTools: ctx.hasTools,
@@ -110,8 +116,9 @@ function handleFastStreamingResponse(c: Context, ctx: StreamHandlerContext): any
  * For clients that accept native Qwen format (langchain, custom clients).
  * Bypasses all JSON.parse, template rewriting, and delta extraction.
  */
-function handleRawPassthrough(c: Context, ctx: StreamHandlerContext): any {
-  const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+function handleRawPassthrough(c: Context, ctx: StreamHandlerContext): Response {
+  const socket = (c.env as { incoming?: { socket?: { setNoDelay?: (flag: boolean) => void } } })?.incoming?.socket
+    || (c.req.raw as unknown as { socket?: { setNoDelay?: (flag: boolean) => void } }).socket;
   if (socket && typeof socket.setNoDelay === 'function') {
     socket.setNoDelay(true);
   }
@@ -124,8 +131,8 @@ function handleRawPassthrough(c: Context, ctx: StreamHandlerContext): any {
     c.header('X-QwenProxy-Session-Id', ctx.sessionId);
   }
 
-  return honoStream(c, async (streamWriter: any) => {
-    let heartbeatInterval: any;
+  return honoStream(c, async (streamWriter: StreamingApi) => {
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
     try {
       await streamWriter.write(': heartbeat\n\n');
       heartbeatInterval = setInterval(async () => {
@@ -152,7 +159,7 @@ function handleRawPassthrough(c: Context, ctx: StreamHandlerContext): any {
   });
 }
 
-export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): any {
+export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): Response {
   // ─── RAW PASSTHROUGH: Zero transformation ───────────────────────────────
   // When client sends X-QwenProxy-Format: raw, forward Qwen SSE bytes directly
   // with zero transformation overhead. For clients that accept native Qwen format.
@@ -168,14 +175,16 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
   if (config.fastStreamProxy && !ctx.hasTools) {
     try {
       return handleFastStreamingResponse(c, ctx);
-    } catch (err: any) {
-      console.warn(`[FastStream] Fast path failed, falling back to standard:`, err.message);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(`[FastStream] Fast path failed, falling back to standard:`, message);
       // Fall through to standard path
     }
   }
 
   // ─── STANDARD PATH: Full parse pipeline ─────────────────────────────────
-  const socket = (c.env as any)?.incoming?.socket || (c.req.raw as any).socket;
+  const socket = (c.env as { incoming?: { socket?: { setNoDelay?: (flag: boolean) => void } } })?.incoming?.socket
+    || (c.req.raw as unknown as { socket?: { setNoDelay?: (flag: boolean) => void } }).socket;
   if (socket && typeof socket.setNoDelay === 'function') {
     socket.setNoDelay(true);
   }
@@ -188,8 +197,8 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
     c.header('X-QwenProxy-Session-Id', ctx.sessionId);
   }
 
-  return honoStream(c, async (streamWriter: any) => {
-    let heartbeatInterval: any;
+  return honoStream(c, async (streamWriter: StreamingApi) => {
+    let heartbeatInterval: ReturnType<typeof setInterval> | undefined;
     try {
       await streamWriter.write(': heartbeat\n\n');
       heartbeatInterval = setInterval(async () => {
@@ -200,11 +209,11 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       }, 15000);
       if (heartbeatInterval.unref) heartbeatInterval.unref();
 
-      const writeEvent = (data: any) => {
+      const writeEvent = (data: Record<string, unknown>) => {
         streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
       };
 
-      const makeChoice = (delta: any, finishReason: string | null = null) => ({
+      const makeChoice = (delta: Record<string, unknown>, finishReason: string | null = null) => ({
         index: 0,
         delta,
         logprobs: null,
@@ -247,7 +256,6 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       // Chunked string buffer — avoids O(n²) from repeated concatenation
       const bufChunks: string[] = [];
       let bufTotalLen = 0;
-      let bufConsumed = 0;
 
       function appendToBuf(decoded: string): void {
         bufChunks.push(decoded);
@@ -255,26 +263,21 @@ export function handleStreamingResponse(c: Context, ctx: StreamHandlerContext): 
       }
 
       function extractLineFromBuf(): string | null {
-        for (let ci = 0; ci < bufChunks.length; ci++) {
-          const nlIdx = bufChunks[ci].indexOf('\n');
-          if (nlIdx !== -1) {
-            let line = '';
-            for (let j = 0; j < ci; j++) line += bufChunks[j];
-            if (nlIdx > 0) line += bufChunks[ci].substring(0, nlIdx);
-            const consumedLen = line.length + 1;
-            bufConsumed += consumedLen;
-            bufChunks.splice(0, ci);
-            // Compact buffer: keep only remaining chunks
-            if (bufChunks.length > 50) {
-              bufChunks.splice(0, Math.floor(bufChunks.length / 2));
-            }
-            if (bufChunks.length > 0) bufChunks[0] = bufChunks[0].substring(nlIdx + 1);
-            bufTotalLen -= consumedLen;
-            if (bufTotalLen < 0) bufTotalLen = 0;
-            return line;
-          }
+        const result = extractLineFromChunks(bufChunks);
+        if (result === null) return null;
+
+        // Index-based trimming: remove fully consumed chunks, then substring
+        // the remaining first chunk past the newline (no re-scanning needed).
+        if (result.chunkIndex > 0) {
+          bufChunks.splice(0, result.chunkIndex);
         }
-        return null;
+        if (bufChunks.length > 0) {
+          bufChunks[0] = bufChunks[0].substring(result.newlineOffset + 1);
+        }
+
+        bufTotalLen -= result.consumed;
+        if (bufTotalLen < 0) bufTotalLen = 0;
+        return result.line;
       }
 
       while (true) {
@@ -579,12 +582,12 @@ export function handleNonStreamingResponse(
   model: string,
   uiSessionId: string,
   hasTools: boolean,
-  tools: any[],
-): any {
+  tools: FunctionToolDefinition[],
+): Promise<Response> {
   return (async () => {
     const reader = stream.getReader();
     const decoder = new TextDecoder();
-    const toolCallsOut: any[] = [];
+    const toolCallsOut: Array<{ id: string; type: 'function'; function: { name: string; arguments: string }; index?: number }> = [];
     let buffer = '';
 
     const qwenParser = new QwenStreamParser(uiSessionId, {
@@ -617,7 +620,7 @@ export function handleNonStreamingResponse(
     const upstreamError = parseQwenErrorPayload(buffer);
     if (upstreamError) {
       removeStream(completionId);
-      return c.json({ error: { message: upstreamError.message } }, upstreamError.status as any);
+      return c.json({ error: { message: upstreamError.message } }, upstreamError.status as ContentfulStatusCode);
     }
 
     const { text: remainingText, toolCalls: remainingToolCalls } = qwenParser.flush();
@@ -649,7 +652,7 @@ export function handleNonStreamingResponse(
       total_tokens: parserState.promptTokens + parserState.completionTokens,
       prompt_tokens_details: { cached_tokens: 0 }
     };
-    const message: any = { role: 'assistant', content: toolCallsOut.length ? null : finalContent };
+    const message: { role: string; content: string | null; reasoning_content?: string; tool_calls?: typeof toolCallsOut } = { role: 'assistant', content: toolCallsOut.length ? null : finalContent };
     if (parserState.reasoningBuffer) message.reasoning_content = parserState.reasoningBuffer;
     if (toolCallsOut.length) toolCallsOut.forEach((tc, idx) => tc.index = idx);
     if (toolCallsOut.length) message.tool_calls = toolCallsOut;

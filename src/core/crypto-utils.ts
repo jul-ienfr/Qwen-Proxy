@@ -59,8 +59,11 @@ export function decrypt(ciphertext: string): string {
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
     decipher.setAuthTag(authTag)
     return decipher.update(encrypted).toString('utf-8') + decipher.final('utf-8')
-  } catch {
-    return ciphertext
+  } catch (err: any) {
+    // Log the error but return empty string instead of ciphertext
+    // Returning ciphertext would silently use encrypted blobs as passwords
+    console.warn(`[Crypto] Decryption failed (wrong key or corrupted data): ${err.message}`)
+    return ''
   }
 }
 

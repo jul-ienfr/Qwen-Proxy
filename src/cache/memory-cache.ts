@@ -16,7 +16,7 @@ interface CacheEntry<T> {
 }
 
 export class MemoryCache {
-  private store: Map<string, CacheEntry<any>>
+  private store: Map<string, CacheEntry<unknown>>
   private defaultTTL: number
   private prefix: string
   private cleanupInterval: NodeJS.Timeout | null
@@ -36,7 +36,7 @@ export class MemoryCache {
     this.startCleanup()
   }
 
-  private entryByteSize(key: string, value: any): number {
+  private entryByteSize(key: string, value: unknown): number {
     const valueStr = typeof value === 'string' ? value : JSON.stringify(value)
     return Buffer.byteLength(key) + Buffer.byteLength(valueStr || '')
   }
@@ -56,10 +56,12 @@ export class MemoryCache {
       const now = Date.now()
       for (const [key, entry] of this.store.entries()) {
         if (entry.expiresAt <= now) {
+          this.totalBytes -= this.entryByteSize(key, entry.value)
           this.store.delete(key)
         }
       }
     }, 60000)
+    if (this.cleanupInterval?.unref) this.cleanupInterval.unref()
   }
 
   async connect(): Promise<void> {
@@ -186,10 +188,22 @@ export class MemoryCache {
   }
 
   async scan(pattern: string, _count: number = 100): Promise<string[]> {
-    const regex = new RegExp(this.prefix + pattern.replace(/\*/g, '.*'))
+    // Use cached regex to avoid recompilation on every call
+    const cacheKey = pattern
+    let regex = this.scanRegexCache.get(cacheKey)
+    if (!regex) {
+      regex = new RegExp(this.prefix + pattern.replace(/\*/g, '.*'))
+      // Cap cache size to prevent memory leak
+      if (this.scanRegexCache.size > 100) {
+        const firstKey = this.scanRegexCache.keys().next().value
+        if (firstKey) this.scanRegexCache.delete(firstKey)
+      }
+      this.scanRegexCache.set(cacheKey, regex)
+    }
+
     const now = Date.now()
     const keys: string[] = []
-    
+
     for (const [key, entry] of this.store.entries()) {
       if (regex.test(key) && entry.expiresAt > now) {
         keys.push(key)

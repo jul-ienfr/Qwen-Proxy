@@ -13,6 +13,7 @@ import { updateSessionParent } from './qwen.js';
 import { QwenUpstreamError } from './error-handler.js';
 import { getIncrementalDelta } from '../routes/sse-parser.js';
 import { escapeJsonStringFast } from '../utils/fast-escape.js';
+import { extractLineFromChunks } from '../utils/line-extractor.js';
 
 // ─── Pre-computed Templates ──────────────────────────────────────────────────
 
@@ -129,7 +130,8 @@ export function extractFast(dataStr: string): FastExtractResult {
  * Returns null on malformed input.
  */
 export function extractJsonString(data: string, start: number): string | null {
-  let result = '';
+  // Use array join instead of string += to avoid O(n²) intermediate allocations
+  const parts: string[] = [];
   let i = start;
   const len = data.length;
 
@@ -137,33 +139,35 @@ export function extractJsonString(data: string, start: number): string | null {
     const ch = data.charCodeAt(i);
 
     if (ch === 0x22) { // closing "
-      return result;
+      return parts.length === 0 ? '' : parts.join('');
     } else if (ch === 0x5C) { // backslash
       if (i + 1 >= len) return null;
       const esc = data.charCodeAt(i + 1);
       switch (esc) {
-        case 0x22: result += '"'; break;   // \"
-        case 0x5C: result += '\\'; break;  // \\
-        case 0x6E: result += '\n'; break;  // \n
-        case 0x72: result += '\r'; break;  // \r
-        case 0x74: result += '\t'; break;  // \t
-        case 0x62: result += '\b'; break;  // \b
-        case 0x66: result += '\f'; break;  // \f
+        case 0x22: parts.push('"'); break;   // \"
+        case 0x5C: parts.push('\\'); break;  // \\
+        case 0x6E: parts.push('\n'); break;  // \n
+        case 0x72: parts.push('\r'); break;  // \r
+        case 0x74: parts.push('\t'); break;  // \t
+        case 0x62: parts.push('\b'); break;  // \b
+        case 0x66: parts.push('\f'); break;  // \f
         case 0x75: { // \uXXXX
           if (i + 5 >= len) return null;
           const hex = data.substring(i + 2, i + 6);
           const code = parseInt(hex, 16);
           if (isNaN(code)) return null;
-          result += String.fromCharCode(code);
+          parts.push(String.fromCharCode(code));
           i += 4; // extra skip for hex digits
           break;
         }
-        default: result += data[i + 1]; break;
+        default: parts.push(data[i + 1]); break;
       }
       i += 2;
     } else {
-      result += data[i];
-      i++;
+      // Collect consecutive non-escape characters as a substring
+      const segmentStart = i;
+      while (i < len && data.charCodeAt(i) !== 0x22 && data.charCodeAt(i) !== 0x5C) i++;
+      parts.push(data.substring(segmentStart, i));
     }
   }
   return null; // unterminated string
@@ -327,41 +331,23 @@ export function createDirectStreamProxy(
   }
 
   function extractLine(): string | null {
-    // Find newline across chunks without concatenation
-    let scanned = 0;
-    for (let ci = 0; ci < bufChunks.length; ci++) {
-      const chunk = bufChunks[ci];
-      const nlIdx = chunk.indexOf('\n');
-      if (nlIdx !== -1) {
-        // Found newline in this chunk — build line from partial chunks
-        let line = '';
-        // Append complete chunks before this one
-        for (let j = 0; j < ci; j++) {
-          line += bufChunks[j];
-        }
-        // Append partial from this chunk (before newline)
-        if (nlIdx > 0) line += chunk.substring(0, nlIdx);
+    const result = extractLineFromChunks(bufChunks);
+    if (result === null) return null;
 
-        // consumed = line.length + 1 (for the newline)
-        const consumedLen = line.length + 1;
-        bufConsumed += consumedLen;
+    bufConsumed += result.consumed;
 
-        // Remove consumed chunks
-        const removeUpTo = ci; // remove chunks 0..ci-1 entirely
-        if (removeUpTo > 0) {
-          bufChunks.splice(0, removeUpTo);
-        }
-        // Trim the start of the remaining first chunk
-        if (bufChunks.length > 0) {
-          bufChunks[0] = bufChunks[0].substring(nlIdx + 1);
-        }
-        bufTotalLen -= consumedLen;
-        if (bufTotalLen < 0) bufTotalLen = 0;
-
-        return line;
-      }
+    // Index-based trimming: remove fully consumed chunks, then substring
+    // the remaining first chunk past the newline (no re-scanning needed).
+    if (result.chunkIndex > 0) {
+      bufChunks.splice(0, result.chunkIndex);
     }
-    return null; // no complete line yet
+    if (bufChunks.length > 0) {
+      bufChunks[0] = bufChunks[0].substring(result.newlineOffset + 1);
+    }
+
+    bufTotalLen -= result.consumed;
+    if (bufTotalLen < 0) bufTotalLen = 0;
+    return result.line;
   }
 
   function compactBuffer(): void {

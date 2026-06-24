@@ -24,7 +24,7 @@ const refillPromises: Map<string, Promise<void>> = new Map();
 
 const WARM_POOL_SIZE = parseInt(process.env.WARM_POOL_SIZE || '10', 10);
 const WARM_POOL_TTL_MS = 10 * 60 * 1000;
-const WARM_POOL_LOW_WATER = parseInt(process.env.WARM_POOL_LOW_WATER || '3', 10);
+const _WARM_POOL_LOW_WATER = parseInt(process.env.WARM_POOL_LOW_WATER || '3', 10);
 const HEADERS_TTL_MS = 4 * 60 * 1000; // Headers valid for 4 min (browser TTL is 5 min)
 const WARM_POOL_PARALLEL = parseInt(process.env.WARM_POOL_PARALLEL || '8', 10); // Parallel chat creation
 const WARM_POOL_DELAY_MS = parseInt(process.env.WARM_POOL_DELAY_MS || '100', 10); // Delay between creations
@@ -33,6 +33,8 @@ const WARM_POOL_PROACTIVE_THRESHOLD = Math.floor(WARM_POOL_SIZE * 0.7); // Proac
 let cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 const CLEANUP_INTERVAL_MS = 60_000; // Clean every 60 seconds
+let totalInFlightRefills = 0;
+const MAX_GLOBAL_REFILLS = 20; // Cap total concurrent refills across all accounts
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -143,7 +145,15 @@ async function createRealQwenChat(header: Record<string, string>, accountId?: st
       if (!result.status || result.status >= 400) {
         throw new Error(`Failed to create chat: ${result.status} - ${result.body}`);
       }
-      const json = JSON.parse(result.body);
+      // Strip SSE "data: " prefix if present — Qwen sometimes returns SSE-wrapped JSON
+      let bodyStr = result.body || '';
+      if (bodyStr.startsWith('data: ')) {
+        bodyStr = bodyStr.slice(6).split('\n')[0].trim();
+      }
+      if (bodyStr === '[DONE]' || !bodyStr) {
+        throw new Error(`Unexpected empty/SSE response from chat creation`);
+      }
+      const json = JSON.parse(bodyStr);
       if (json && json.success === false) {
         const code = json.data?.code || json.code || 'UpstreamError';
         const details = json.data?.details || json.message || 'Qwen returned an error';
@@ -251,6 +261,10 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
   }
 
   try {
+    // Strip SSE "data: " prefix if present
+    if (body.startsWith('data: ')) {
+      body = body.slice(6).split('\n')[0].trim();
+    }
     const json = JSON.parse(body);
     if (!json.success || !Array.isArray(json.data)) return [];
     const unused: string[] = [];
@@ -266,6 +280,13 @@ async function fetchUnusedChats(headers: Record<string, string>, accountId?: str
 }
 
 async function refillPoolForAccount(accountId: string) {
+  // Global concurrency cap to prevent thundering herd on startup
+  if (totalInFlightRefills >= MAX_GLOBAL_REFILLS) {
+    console.warn(`[WarmPool] Global refill cap reached (${MAX_GLOBAL_REFILLS}), skipping ${accountId}`);
+    return;
+  }
+  totalInFlightRefills++;
+  try {
   let pool = warmPool.get(accountId);
   if (!pool) { pool = []; warmPool.set(accountId, pool); }
   cleanupStalePool(accountId);
@@ -348,6 +369,9 @@ async function refillPoolForAccount(accountId: string) {
   if (created > 0) {
     console.log(`[WarmPool] Created ${created} chats for ${accountId} (parallel: ${WARM_POOL_PARALLEL})`);
   }
+  } finally {
+    totalInFlightRefills--;
+  }
 }
 
 export async function getWarmedChat(accountId?: string) {
@@ -368,7 +392,7 @@ export async function getWarmedChat(accountId?: string) {
     await withTimeout(refillPromises.get(key)!, config.timeouts.http, `Warm pool refill for ${key}`);
   }
   if (pool.length === 0) {
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise(r => setTimeout(r, 300 + Math.floor(Math.random() * 200)));
     if (!refillPromises.has(key)) {
       refillPromises.set(key, refillPoolForAccount(key).finally(() => refillPromises.delete(key)));
     }

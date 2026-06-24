@@ -573,10 +573,14 @@ export class ConfigManager extends EventEmitter {
     const config = this.getSanitizedConfig()
     const metadata: Record<string, any> = {}
 
+    // Sensitive paths that should never expose raw values
+    const sensitivePaths = new Set(['apiKey', 'qwen.apiKey', 'redis.token'])
+
     for (const [path, meta] of Object.entries(CONFIG_METADATA)) {
+      const rawValue = this.get(path)
       metadata[path] = {
         ...meta,
-        currentValue: this.get(path),
+        currentValue: sensitivePaths.has(path) ? maskSecret(rawValue) : rawValue,
         defaultValue: this.getDefault(path),
         isOverridden: path in this._overrides,
       }

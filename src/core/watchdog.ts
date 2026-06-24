@@ -23,6 +23,7 @@ export class Watchdog extends EventEmitter {
         this.consecutiveFailures++
       })
     }, config.watchdog.checkInterval)
+    if (this.checkInterval.unref) this.checkInterval.unref()
 
     this.emit('started')
   }
@@ -74,7 +75,7 @@ export class Watchdog extends EventEmitter {
   }
 
   private checkStreams(): 'ok' | 'congested' | 'blocked' {
-    const activeStreams = metrics.get('streams.active')?.value || 0
+    const activeStreams = (metrics.get('streams.active')?.value as number) || 0
     if (activeStreams > config.watchdog.streams.criticalThreshold) return 'blocked'
     if (activeStreams > config.watchdog.streams.warningThreshold) return 'congested'
     return 'ok'
@@ -141,6 +142,29 @@ export class Watchdog extends EventEmitter {
   }
 
   private async recoverStreams(): Promise<void> {
+    try {
+      const { getAllStreams, removeStream } = await import('./stream-registry.js')
+      const streams = getAllStreams()
+      const now = Date.now()
+      let killed = 0
+
+      // Kill streams older than 5 minutes (stale/blocked)
+      const STALE_THRESHOLD_MS = 5 * 60 * 1000
+      for (const [id, stream] of streams) {
+        if (stream.createdAt && now - stream.createdAt > STALE_THRESHOLD_MS) {
+          try {
+            stream.abortController?.abort(new Error('watchdog-stale-stream'))
+            removeStream(id)
+            killed++
+          } catch { /* ignore */ }
+        }
+      }
+
+      console.log(`[Watchdog] Stream recovery: killed ${killed} stale stream(s) out of ${streams.size} total`)
+      metrics.increment('watchdog.recovery.streams_killed', killed)
+    } catch (err: any) {
+      console.error(`[Watchdog] Stream recovery failed: ${err.message}`)
+    }
     this.emit('recovery:streams:throttled')
   }
 

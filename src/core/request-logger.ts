@@ -152,6 +152,9 @@ export class RequestLogger {
   private buffer: RequestLog[] = [];
   private flushInterval: NodeJS.Timeout | null = null;
   private flushIntervalMs: number = 5000; // Flush every 5 seconds
+  private maxBufferSize: number = 10000;
+  private consecutiveFailures: number = 0;
+  private maxConsecutiveFailures: number = 5;
 
   constructor() {
     this.enabled = config.logging?.enabled !== false;
@@ -164,9 +167,23 @@ export class RequestLogger {
    * Start periodic flush interval
    */
   private startFlushInterval(): void {
+    if (this.flushInterval) return; // Already running
     this.flushInterval = setInterval(() => {
       this.flush();
     }, this.flushIntervalMs);
+    if (this.flushInterval.unref) {
+      this.flushInterval.unref();
+    }
+  }
+
+  /**
+   * Start logging (for hot-reload toggle)
+   */
+  start(): void {
+    if (!this.enabled) {
+      this.enabled = true;
+      this.startFlushInterval();
+    }
   }
 
   /**
@@ -200,6 +217,11 @@ export class RequestLogger {
     if (this.buffer.length >= 100) {
       this.flush();
     }
+
+    // Cap buffer to prevent unbounded growth under sustained load
+    if (this.buffer.length > this.maxBufferSize) {
+      this.buffer = this.buffer.slice(-this.maxBufferSize);
+    }
   }
 
   /**
@@ -207,6 +229,11 @@ export class RequestLogger {
    */
   async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
+
+    // Circuit breaker: stop flushing if DB is persistently broken
+    if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+      return;
+    }
 
     const entries = [...this.buffer];
     this.buffer = [];
@@ -217,10 +244,15 @@ export class RequestLogger {
       for (const entry of entries) {
         await requestStore.log(entry);
       }
+      this.consecutiveFailures = 0; // Reset on success
     } catch (err: any) {
-      console.error(`[RequestLogger] Failed to flush: ${err.message}`);
-      // Re-add entries to buffer on failure
-      this.buffer.unshift(...entries);
+      this.consecutiveFailures++;
+      console.error(`[RequestLogger] Failed to flush (${this.consecutiveFailures}/${this.maxConsecutiveFailures}): ${err.message}`);
+      // Re-add entries to buffer only if under max capacity
+      if (this.buffer.length < this.maxBufferSize) {
+        const space = this.maxBufferSize - this.buffer.length;
+        this.buffer.unshift(...entries.slice(0, space));
+      }
     }
   }
 

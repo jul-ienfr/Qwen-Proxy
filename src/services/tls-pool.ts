@@ -23,8 +23,8 @@ const POOL_SIZE = parseInt(process.env.TLS_POOL_SIZE || '5', 10);
 const KEEPALIVE_MS = parseInt(process.env.TLS_KEEPALIVE_MS || '30000', 10);
 const MAX_SOCKETS = parseInt(process.env.TLS_MAX_SOCKETS || '10', 10);
 const HEALTH_CHECK_MS = parseInt(process.env.TLS_HEALTH_CHECK_MS || '15000', 10);
-const CONNECTION_WARMUP_MS = parseInt(process.env.TLS_WARMUP_MS || '100', 10);
-const USE_HTTP3 = process.env.USE_HTTP3 === 'true'; // Experimental HTTP/3 via QUIC
+const _CONNECTION_WARMUP_MS = parseInt(process.env.TLS_WARMUP_MS || '100', 10);
+const _USE_HTTP3 = process.env.USE_HTTP3 === 'true'; // Experimental HTTP/3 via QUIC
 
 // ─── HTTP/2 Session Pool ─────────────────────────────────────────────────────
 
@@ -39,6 +39,7 @@ interface H2SessionEntry {
 class H2ConnectionPool {
   private sessions: H2SessionEntry[] = [];
   private connecting = false;
+  private connectPromise: Promise<void> | null = null;
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private h2Supported: boolean;
   private consecutiveH2Failures = 0;
@@ -98,15 +99,17 @@ class H2ConnectionPool {
    * Falls back to HTTP/1.1 if HTTP/2 is not supported.
    */
   private async createSession(): Promise<http2.ClientHttp2Session> {
-    if (this.connecting) {
-      // Wait for ongoing connection attempt
-      await new Promise(resolve => setTimeout(resolve, 100));
+    if (this.connecting && this.connectPromise) {
+      // Wait for ongoing connection attempt via Promise gate (not sleep)
+      await this.connectPromise;
       if (this.sessions.length > 0) {
         return this.selectBestSession().session;
       }
     }
 
     this.connecting = true;
+    let resolveConnect!: () => void;
+    this.connectPromise = new Promise<void>(r => { resolveConnect = r; });
     try {
       const authority = 'https://chat.qwen.ai';
 
@@ -117,7 +120,7 @@ class H2ConnectionPool {
           initialWindowSize: 65535,
           headerTableSize: 4096,
         },
-        createConnection: (authority, option) => {
+        createConnection: (authority, _option) => {
           // Use TLS with session resumption
           const tlsSocket = tls.connect({
             host: authority.hostname,
@@ -168,6 +171,8 @@ class H2ConnectionPool {
       return session;
     } finally {
       this.connecting = false;
+      this.connectPromise = null;
+      resolveConnect();
     }
   }
 
@@ -264,7 +269,7 @@ class H2ConnectionPool {
 
 // ─── HTTP/1.1 Keep-Alive Agent Pool (Fallback) ──────────────────────────────
 
-const httpsAgent = new https.Agent({
+const _httpsAgent = new https.Agent({
   keepAlive: true,
   keepAliveMsecs: KEEPALIVE_MS,
   maxSockets: MAX_SOCKETS,
@@ -273,7 +278,7 @@ const httpsAgent = new https.Agent({
   rejectUnauthorized: true,
 });
 
-const httpAgent = new http.Agent({
+const _httpAgent = new http.Agent({
   keepAlive: true,
   keepAliveMsecs: KEEPALIVE_MS,
   maxSockets: MAX_SOCKETS,
@@ -433,11 +438,11 @@ async function h2Fetch(
     }, options.timeoutMs);
   }
 
-  // Handle abort
+  // Handle abort (once: true prevents listener leak on short-lived signals)
   if (options.signal) {
     options.signal.addEventListener('abort', () => {
       req.destroy(new Error('Request aborted'));
-    });
+    }, { once: true });
   }
 
   try {
@@ -471,7 +476,7 @@ async function http1Fetch(
       headers: options.headers,
       body: options.body,
       signal: options.signal || controller.signal,
-      // @ts-ignore - Node.js experimental
+      // @ts-expect-error - Node.js experimental
       dispatcher: undefined, // Would use undici.Agent for true pooling
     });
 
@@ -524,7 +529,7 @@ async function http1FetchStream(
       headers: options.headers,
       body: options.body,
       signal: options.signal || controller.signal,
-      // @ts-ignore - Node.js experimental
+      // @ts-expect-error - Node.js experimental
       dispatcher: undefined, // Would use undici.Agent for true pooling
     });
 
